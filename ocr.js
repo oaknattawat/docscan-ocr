@@ -207,8 +207,8 @@ const OCREngine = (() => {
       }
     }
 
-    // Only rotate if skew is meaningful (>= 0.7°) and clearly sharper than 0°
-    if (Math.abs(bestAngle) < 0.7 || bestScore < zeroScore * 1.12) {
+    // Only rotate if skew is meaningful (>= 1.5°) and clearly sharper than 0° (avoids blurring 1px Thai tone marks)
+    if (Math.abs(bestAngle) < 1.5 || bestScore < zeroScore * 1.25) {
       return srcCanvas;
     }
 
@@ -332,10 +332,29 @@ const OCREngine = (() => {
       histogram[g]++;
     }
 
+    // Auto-invert dark-mode screenshots/photos (dark background + light text) for Tesseract
+    const totalPixels = w * h;
+    let darkCheckSum = 0;
+    let medianGray = 255;
+    for (let i = 0; i < 256; i++) {
+      darkCheckSum += histogram[i];
+      if (darkCheckSum >= totalPixels * 0.5) {
+        medianGray = i;
+        break;
+      }
+    }
+    if (medianGray < 105) {
+      histogram.fill(0);
+      for (let i = 0; i < gray.length; i++) {
+        const inv = 255 - gray[i];
+        gray[i] = inv;
+        histogram[inv]++;
+      }
+    }
+
     // Contrast stretch (0.5% - 99.5%)
     let minVal = -1;
     let maxVal = 255;
-    const totalPixels = w * h;
     let cumSum = 0;
     for (let i = 0; i < 256; i++) {
       cumSum += histogram[i];
@@ -360,7 +379,7 @@ const OCREngine = (() => {
       }
     }
 
-    // Soft background whitening: push shadow/paper to 255, preserve smooth dark strokes
+    // Soft background whitening: preserve thin Thai tone marks (่ ้ ๊ ๋) while whitening paper
     for (let y = 0; y < h; y++) {
       const y1 = Math.max(0, y - halfBlock);
       const y2 = Math.min(h - 1, y + halfBlock);
@@ -376,14 +395,14 @@ const OCREngine = (() => {
 
         const g = gray[y * w + x];
         let val;
-        if (g < 65) {
+        if (g < 70) {
           val = g;
-        } else if (g >= localMean - 8 && g > 130) {
+        } else if (g >= localMean - 3 && g > 155) {
           val = 255;
         } else {
-          // Smoothly darken ink relative to local background
-          const thresh = Math.max(localMean - 8, 80);
-          val = Math.max(0, Math.min(255, Math.round((g / thresh) * 210)));
+          // Darken thin anti-aliased ink/tone-marks relative to local background
+          const thresh = Math.max(localMean, 90);
+          val = Math.max(0, Math.min(240, Math.round((g / thresh) * 185)));
         }
 
         const pi = (y * w + x) * 4;
@@ -597,6 +616,18 @@ const OCREngine = (() => {
     const symbolRatio = 1 - (alnumMatches.length / t.length);
     if (t.length <= 6 && conf < 40 && symbolRatio > 0.35) return true;
     if (symbolRatio > 0.65 && conf < 55) return true;
+
+    // Filter fragmented screen/texture hallucinations (e.g. "v - a »v", "๑ | จ v ๑", "ซ ๕")
+    if (conf < 48 && t.length <= 18) {
+      const tokens = t.split(/\s+/).filter(Boolean);
+      const singleTokens = tokens.filter(tok => tok.length === 1).length;
+      if (tokens.length >= 2 && singleTokens / tokens.length >= 0.65 && !/^\d+$/.test(tokens[0])) {
+        return true;
+      }
+      if (/[\u0E50-\u0E59]/.test(t) && tokens.length >= 2) {
+        return true;
+      }
+    }
 
     return false;
   }
