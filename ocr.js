@@ -1153,6 +1153,8 @@ const OCREngine = (() => {
     if (confidence > 0 && confidence < 45) return 'body';
     if (/^[•▪▸►\*]\s/.test(t) || /^-\s+\S/.test(t)) return 'bullet';
     if (!isValidHeadingCandidate(t, confidence)) return 'body';
+    // Trailing continuation clauses (e.g. wrapped last line "แบ่งเป็นหัวข้อ", "งานได้") must never become headings
+    if (/^(แบ่งเป็น|งานได้|และ|หรือ|โดย|แต่|ซึ่ง|เพื่อ|สำหรับ)/.test(t) && t.length <= 45) return 'body';
 
     const relSize = medianSize > 0 ? fontSize / medianSize : 1;
     const proseOrMeta = isProseOrMetadata(t);
