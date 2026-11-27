@@ -97,14 +97,144 @@ const OCREngine = (() => {
   }
 
   /**
-   * Light preprocessing: upscale + white padding + gentle contrast (NO grayscale/binarize)
+   * Unsharp mask sharpening on RGBA ImageData (crisp text edges for mobile photos).
+   * Only boosts pixels with real edge contrast (> threshold) so flat paper stays clean.
+   */
+  function sharpenImageData(imageData, amount = 0.45, threshold = 8) {
+    const { width: w, height: h, data } = imageData;
+    if (w < 3 || h < 3) return;
+    const orig = new Uint8Array(data);
+
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const idx = (y * w + x) * 4;
+        for (let c = 0; c < 3; c++) {
+          const center = orig[idx + c];
+          const avg = (
+            orig[idx - 4 + c] +
+            orig[idx + 4 + c] +
+            orig[idx - w * 4 + c] +
+            orig[idx + w * 4 + c]
+          ) * 0.25;
+          const diff = center - avg;
+          if (Math.abs(diff) > threshold) {
+            data[idx + c] = Math.max(0, Math.min(255, Math.round(center + diff * amount)));
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Fast projection-profile auto-deskew (-8° to +8°) for tilted handheld mobile photos.
+   * Only rotates when there is a clear horizontal text-line peak beating 0°.
+   */
+  function autoDeskewCanvas(srcCanvas) {
+    const sw = srcCanvas.width;
+    const sh = srcCanvas.height;
+    if (sw < 120 || sh < 120) return srcCanvas;
+
+    const sampleMax = 360;
+    const scale = Math.min(1, sampleMax / Math.max(sw, sh));
+    const w = Math.max(40, Math.round(sw * scale));
+    const h = Math.max(40, Math.round(sh * scale));
+
+    const tmp = document.createElement('canvas');
+    tmp.width = w;
+    tmp.height = h;
+    const tCtx = tmp.getContext('2d');
+    tCtx.drawImage(srcCanvas, 0, 0, w, h);
+    const px = tCtx.getImageData(0, 0, w, h).data;
+
+    // Build horizontal edge-energy map (sensitive to text strokes regardless of paper tint)
+    const energy = new Float64Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = (y * w + x) * 4;
+        const gPrev = 0.3 * px[i - 4] + 0.59 * px[i - 3] + 0.11 * px[i - 2];
+        const gNext = 0.3 * px[i + 4] + 0.59 * px[i + 5] + 0.11 * px[i + 6];
+        const diff = Math.abs(gNext - gPrev);
+        energy[y * w + x] = diff > 14 ? diff : 0;
+      }
+    }
+
+    const scoreAngle = (deg) => {
+      const rad = (deg * Math.PI) / 180;
+      const sin = Math.sin(rad);
+      const cos = Math.cos(rad);
+      const cx = w * 0.5;
+      const cy = h * 0.5;
+      const proj = new Float64Array(h);
+
+      for (let y = 2; y < h - 2; y += 2) {
+        for (let x = 2; x < w - 2; x += 2) {
+          const val = energy[y * w + x];
+          if (val === 0) continue;
+          const ry = Math.round((x - cx) * sin + (y - cy) * cos + cy);
+          if (ry >= 0 && ry < h) proj[ry] += val;
+        }
+      }
+
+      let score = 0;
+      for (let y = 1; y < h; y++) {
+        const d = proj[y] - proj[y - 1];
+        score += d * d;
+      }
+      return score;
+    };
+
+    const zeroScore = scoreAngle(0);
+    if (zeroScore <= 0) return srcCanvas;
+
+    let bestAngle = 0;
+    let bestScore = zeroScore;
+    for (let a = -8; a <= 8.01; a += 0.8) {
+      if (Math.abs(a) < 0.1) continue;
+      const s = scoreAngle(a);
+      if (s > bestScore) {
+        bestScore = s;
+        bestAngle = a;
+      }
+    }
+
+    // Refine around best coarse angle
+    const centerA = bestAngle;
+    for (let a = centerA - 0.6; a <= centerA + 0.61; a += 0.2) {
+      const s = scoreAngle(a);
+      if (s > bestScore) {
+        bestScore = s;
+        bestAngle = a;
+      }
+    }
+
+    // Only rotate if skew is meaningful (>= 0.7°) and clearly sharper than 0°
+    if (Math.abs(bestAngle) < 0.7 || bestScore < zeroScore * 1.12) {
+      return srcCanvas;
+    }
+
+    const rad = (-bestAngle * Math.PI) / 180;
+    const out = document.createElement('canvas');
+    out.width = sw;
+    out.height = sh;
+    const oCtx = out.getContext('2d');
+    oCtx.fillStyle = '#ffffff';
+    oCtx.fillRect(0, 0, sw, sh);
+    oCtx.translate(sw / 2, sh / 2);
+    oCtx.rotate(rad);
+    oCtx.drawImage(srcCanvas, -sw / 2, -sh / 2);
+    return out;
+  }
+
+  /**
+   * Light preprocessing: deskew + upscale + white padding + gentle shadow balance & crisp sharpening.
    * Preserves colored banners, highlighters, and fine Thai diacritics.
    */
   function preprocessLight(source) {
-    const srcCanvas = getSourceCanvas(source);
-    if (!srcCanvas) return source;
+    const rawCanvas = getSourceCanvas(source);
+    if (!rawCanvas) return source;
+    const srcCanvas = autoDeskewCanvas(rawCanvas);
 
-    const outCanvas = scaleAndPadCanvas(srcCanvas, 2200, 3200, 24);
+    const outCanvas = scaleAndPadCanvas(srcCanvas, 2200, 3000, 24);
     const outCtx = outCanvas.getContext('2d');
     const w = outCanvas.width;
     const h = outCanvas.height;
@@ -112,27 +242,79 @@ const OCREngine = (() => {
     const imageData = outCtx.getImageData(0, 0, w, h);
     const data = imageData.data;
 
-    // Gentle contrast boost (18%) without clipping dark colored banners
+    // Coarse 24x24 grid background brightness estimate (lifts mobile camera shadows without washing out colors)
+    const gridN = 24;
+    const cellW = Math.max(1, Math.ceil(w / gridN));
+    const cellH = Math.max(1, Math.ceil(h / gridN));
+    const bgGrid = new Float64Array(gridN * gridN);
+    let globalMaxBg = 0;
+
+    for (let gy = 0; gy < gridN; gy++) {
+      for (let gx = 0; gx < gridN; gx++) {
+        const xStart = gx * cellW;
+        const yStart = gy * cellH;
+        const xEnd = Math.min(w, xStart + cellW);
+        const yEnd = Math.min(h, yStart + cellH);
+        let maxLum = 0;
+        const step = Math.max(2, Math.floor(Math.min(cellW, cellH) / 6));
+        for (let y = yStart; y < yEnd; y += step) {
+          for (let x = xStart; x < xEnd; x += step) {
+            const idx = (y * w + x) * 4;
+            const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+            if (lum > maxLum) maxLum = lum;
+          }
+        }
+        bgGrid[gy * gridN + gx] = maxLum;
+        if (maxLum > globalMaxBg) globalMaxBg = maxLum;
+      }
+    }
+
+    const targetBg = Math.min(250, Math.max(210, globalMaxBg));
     const contrast = 1.18;
     const midpoint = 128;
-    for (let i = 0; i < data.length; i += 4) {
-      data[i]     = Math.max(0, Math.min(255, Math.round((data[i]     - midpoint) * contrast + midpoint)));
-      data[i + 1] = Math.max(0, Math.min(255, Math.round((data[i + 1] - midpoint) * contrast + midpoint)));
-      data[i + 2] = Math.max(0, Math.min(255, Math.round((data[i + 2] - midpoint) * contrast + midpoint)));
+
+    for (let y = 0; y < h; y++) {
+      const gyF = Math.min(gridN - 1.001, (y / h) * gridN);
+      const gy0 = Math.floor(gyF);
+      const gy1 = Math.min(gridN - 1, gy0 + 1);
+      const fy = gyF - gy0;
+
+      for (let x = 0; x < w; x++) {
+        const gxF = Math.min(gridN - 1.001, (x / w) * gridN);
+        const gx0 = Math.floor(gxF);
+        const gx1 = Math.min(gridN - 1, gx0 + 1);
+        const fx = gxF - gx0;
+
+        const b00 = bgGrid[gy0 * gridN + gx0];
+        const b10 = bgGrid[gy0 * gridN + gx1];
+        const b01 = bgGrid[gy1 * gridN + gx0];
+        const b11 = bgGrid[gy1 * gridN + gx1];
+        const localBg = (b00 * (1 - fx) + b10 * fx) * (1 - fy) + (b01 * (1 - fx) + b11 * fx) * fy;
+
+        const gain = localBg >= 105 ? Math.min(1.65, targetBg / localBg) : 1;
+        const i = (y * w + x) * 4;
+        for (let c = 0; c < 3; c++) {
+          const normalized = data[i + c] * gain;
+          data[i + c] = Math.max(0, Math.min(255, Math.round((normalized - midpoint) * contrast + midpoint)));
+        }
+      }
     }
+
+    sharpenImageData(imageData, 0.4, 8);
     outCtx.putImageData(imageData, 0, 0);
     return outCanvas;
   }
 
   /**
-   * Document preprocessing: grayscale + contrast normalize + soft background whitening
+   * Document preprocessing: deskew + grayscale + contrast normalize + soft background whitening
    * Keeps anti-aliased grayscale strokes intact for Tesseract LSTM (avoids harsh 0/255 damage).
    */
   function preprocessDocument(source) {
-    const srcCanvas = getSourceCanvas(source);
-    if (!srcCanvas) return source;
+    const rawCanvas = getSourceCanvas(source);
+    if (!rawCanvas) return source;
+    const srcCanvas = autoDeskewCanvas(rawCanvas);
 
-    const procCanvas = scaleAndPadCanvas(srcCanvas, 2000, 3200, 24);
+    const procCanvas = scaleAndPadCanvas(srcCanvas, 2000, 3000, 24);
     const procCtx = procCanvas.getContext('2d');
     const w = procCanvas.width;
     const h = procCanvas.height;
@@ -210,12 +392,14 @@ const OCREngine = (() => {
       }
     }
 
+    sharpenImageData(imageData, 0.35, 10);
     procCtx.putImageData(imageData, 0, 0);
     return procCanvas;
   }
 
   /**
    * Auto-detect: analyze image color saturation to pick between photo and document mode.
+   * Ignores subtle warm indoor paper tint on mobile B&W document photos.
    */
   function autoDetectMode(source) {
     const canvas = getSourceCanvas(source);
@@ -231,7 +415,7 @@ const OCREngine = (() => {
 
     const data = sCtx.getImageData(0, 0, w, h).data;
     let totalSat = 0;
-    let colorPixels = 0;
+    let vividPixels = 0;
     let sampled = 0;
 
     for (let i = 0; i < data.length; i += 16) {
@@ -240,14 +424,14 @@ const OCREngine = (() => {
       const min = Math.min(r, g, b);
       const sat = max > 40 ? (max - min) / max : 0;
       totalSat += sat;
-      if (sat > 0.25) colorPixels++;
+      if (sat > 0.28) vividPixels++;
       sampled++;
     }
 
     const avgSat = sampled ? totalSat / sampled : 0;
-    const colorRatio = sampled ? colorPixels / sampled : 0;
+    const vividRatio = sampled ? vividPixels / sampled : 0;
 
-    if (colorRatio > 0.08 || avgSat > 0.09) {
+    if (vividRatio > 0.05 || avgSat > 0.14) {
       return 'photo';
     }
     return 'document';
@@ -366,12 +550,12 @@ const OCREngine = (() => {
    */
   function joinSegmentWords(words, lineH) {
     let out = '';
+    let prevWord = null;
     for (let i = 0; i < words.length; i++) {
       const wt = cleanWordToken(words[i].text);
       if (!wt) continue;
 
-      if (out.length > 0) {
-        const prevWord = words[i - 1];
+      if (out.length > 0 && prevWord) {
         const gap = (words[i].bbox?.x0 ?? 0) - (prevWord.bbox?.x1 ?? 0);
         const prevCh = out[out.length - 1];
         const currCh = wt[0];
@@ -391,6 +575,7 @@ const OCREngine = (() => {
         }
       }
       out += wt;
+      prevWord = words[i];
     }
     return fixThaiSpaces(out);
   }
@@ -953,9 +1138,236 @@ const OCREngine = (() => {
     return out.trim();
   }
 
+  // ══════════════════════════════════════════════════════════════
+  // GEMINI AI VISION OCR (HIGH-ACCURACY / HANDWRITING / MIND MAP)
+  // ══════════════════════════════════════════════════════════════
+
+  const AI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+
+  function imageSourceToJpegBase64(imageSource, maxDim = 2048) {
+    const srcCanvas = getSourceCanvas(imageSource);
+    if (!srcCanvas) throw new Error('ไม่พบข้อมูลภาพสำหรับส่งวิเคราะห์');
+
+    const sw = srcCanvas.width;
+    const sh = srcCanvas.height;
+    const scale = Math.min(1, maxDim / Math.max(sw, sh));
+    const dw = Math.max(1, Math.round(sw * scale));
+    const dh = Math.max(1, Math.round(sh * scale));
+
+    let targetCanvas = srcCanvas;
+    if (scale < 1) {
+      targetCanvas = document.createElement('canvas');
+      targetCanvas.width = dw;
+      targetCanvas.height = dh;
+      const ctx = targetCanvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, dw, dh);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(srcCanvas, 0, 0, dw, dh);
+    }
+
+    const dataUrl = targetCanvas.toDataURL('image/jpeg', 0.92);
+    return dataUrl.split(',')[1];
+  }
+
+  function buildAIOCRPrompt(lang) {
+    const langHint = lang === 'tha'
+      ? 'Focus on Thai text.'
+      : lang === 'eng'
+      ? 'Focus on English text.'
+      : 'Read both Thai and English text accurately.';
+
+    return [
+      'You are a high-precision OCR transcription engine.',
+      langHint,
+      'Transcribe ALL readable text from this image faithfully and verbatim.',
+      'Rules:',
+      '1. Read every heading, label, bullet point, note, table cell, and handwritten annotation accurately.',
+      '2. Preserve original Thai spelling, tone marks, vowels, numbers, and English words exactly. Do NOT summarize, translate, or paraphrase.',
+      '3. Keep multi-column layouts, mind-map cards, or boxed sections grouped logically: each card/section heading followed by its own body lines inside children.',
+      '4. Ignore purely decorative doodles/icons without text.',
+      '5. Return valid JSON matching the schema: {"sections":[{"type":"h1"|"h2"|"h3"|"body","text":"...","children":[{"type":"body","text":"..."}]}]}.',
+      '   - Use "h1" for main document/title headings, "h2" for card/box subheadings, "h3" for smaller subheadings, and "body" for content lines (join multiple lines in a section with \\n).',
+    ].join('\n');
+  }
+
+  function normalizeAISections(rawSections) {
+    if (!Array.isArray(rawSections)) return [];
+    const normalized = [];
+    rawSections.forEach((sec) => {
+      if (!sec || typeof sec !== 'object') return;
+      const text = String(sec.text || '').trim();
+      const type = ['h1', 'h2', 'h3', 'body'].includes(sec.type) ? sec.type : 'body';
+      const children = Array.isArray(sec.children)
+        ? sec.children
+            .map((c) => ({
+              type: 'body',
+              text: String(c?.text || '').trim(),
+              confidence: 98,
+            }))
+            .filter((c) => c.text.length > 0)
+        : [];
+
+      if (!text && children.length === 0) return;
+
+      if (type === 'body' && children.length > 0) {
+        const mergedText = [text, ...children.map((c) => c.text)].filter(Boolean).join('\n');
+        normalized.push({ type: 'body', text: mergedText, confidence: 98, children: [] });
+      } else {
+        normalized.push({
+          type: text ? type : 'body',
+          text: text || children.map((c) => c.text).join('\n'),
+          confidence: 98,
+          children: text ? children : [],
+        });
+      }
+    });
+    return normalized;
+  }
+
+  function parseAISectionsResponse(rawText) {
+    if (!rawText) return [];
+    let cleaned = rawText.trim();
+    // Strip markdown code fences if present
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+
+    try {
+      const parsed = JSON.parse(cleaned);
+      if (parsed && Array.isArray(parsed.sections)) {
+        return normalizeAISections(parsed.sections);
+      }
+      if (Array.isArray(parsed)) {
+        return normalizeAISections(parsed);
+      }
+    } catch (_) {
+      // Fallback to plain-text structure if model did not emit valid JSON
+    }
+    return fallbackStructure(rawText);
+  }
+
+  async function recognizeWithAI(imageSource, options = {}) {
+    const { apiKey, lang = currentLang, onProgress } = options;
+    const cleanKey = (apiKey || '').trim();
+    if (!cleanKey) {
+      throw new Error('กรุณาใส่ Gemini API Key ก่อนใช้งาน AI OCR');
+    }
+
+    onProgress?.(15, 'กำลังเตรียมภาพสำหรับ AI...');
+    const base64Data = imageSourceToJpegBase64(imageSource, 2048);
+
+    const requestBody = {
+      contents: [
+        {
+          parts: [
+            { text: buildAIOCRPrompt(lang) },
+            { inlineData: { mimeType: 'image/jpeg', data: base64Data } },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            sections: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  type: { type: 'STRING', enum: ['h1', 'h2', 'h3', 'body'] },
+                  text: { type: 'STRING' },
+                  children: {
+                    type: 'ARRAY',
+                    items: {
+                      type: 'OBJECT',
+                      properties: {
+                        type: { type: 'STRING', enum: ['body'] },
+                        text: { type: 'STRING' },
+                      },
+                      required: ['type', 'text'],
+                    },
+                  },
+                },
+                required: ['type', 'text'],
+              },
+            },
+          },
+          required: ['sections'],
+        },
+      },
+    };
+
+    let lastError = null;
+    for (let i = 0; i < AI_MODELS.length; i++) {
+      const model = AI_MODELS[i];
+      onProgress?.(35 + i * 15, `กำลังส่งให้ AI (${model}) อ่านข้อความ...`);
+
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': cleanKey,
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (res.ok) {
+        onProgress?.(85, 'กำลังจัดโครงสร้างข้อความจาก AI...');
+        const payload = await res.json();
+        const candidate = payload?.candidates?.[0];
+        const rawText = (candidate?.content?.parts || [])
+          .map((p) => p.text || '')
+          .join('\n')
+          .trim();
+
+        if (!rawText) {
+          const finishReason = candidate?.finishReason || 'NO_OUTPUT';
+          throw new Error(`AI ไม่พบข้อความในภาพ (${finishReason})`);
+        }
+
+        const sections = parseAISectionsResponse(rawText);
+        const plainText = toPlainText(sections);
+        const lineCount = plainText ? plainText.split('\n').filter((l) => l.trim()).length : 0;
+
+        return {
+          sections,
+          text: plainText,
+          lineCount,
+          confidence: 98,
+          model,
+        };
+      }
+
+      let errMsg = `HTTP ${res.status}`;
+      try {
+        const errJson = await res.json();
+        errMsg = errJson?.error?.message || errMsg;
+      } catch (_) {}
+
+      if (res.status === 404 && i < AI_MODELS.length - 1) {
+        lastError = new Error(errMsg);
+        continue;
+      }
+      if (res.status === 400 || res.status === 401 || res.status === 403) {
+        throw new Error(`Gemini API Key ไม่ถูกต้องหรือไม่มีสิทธิ์ใช้งาน (${errMsg})`);
+      }
+      if (res.status === 429) {
+        throw new Error('ใช้งานเกินโควต้าฟรีชั่วคราว กรุณารอสักครู่แล้วลองใหม่');
+      }
+      throw new Error(`AI OCR ล้มเหลว: ${errMsg}`);
+    }
+
+    throw lastError || new Error('ไม่สามารถเชื่อมต่อ Gemini API ได้');
+  }
+
   return {
     init,
     recognize,
+    recognizeWithAI,
+    parseAISectionsResponse,
     terminate,
     structureText,
     renderToDOM,
@@ -963,6 +1375,7 @@ const OCREngine = (() => {
     preprocessImage,
     fixThaiSpaces,
     MODE_CONFIG,
+    AI_MODELS,
     setLang: (l) => {
       if (currentLang !== l) isReady = false;
       currentLang = l;

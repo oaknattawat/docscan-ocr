@@ -133,17 +133,30 @@
       <div class="card-body">
 
         <!-- Tool Buttons (image mode) -->
-        <div class="tool-row" id="image-tools">
-          <button id="detect-btn" class="btn btn-primary" disabled>
-            🔍 ตรวจจับขอบ
-          </button>
-          <button id="crop-btn" class="btn btn-success" disabled>
-            ✂️ ตัดเอกสาร
-          </button>
+        <div id="image-tools" style="display:flex; flex-direction:column; gap:8px">
+          <div class="tool-row">
+            <button id="detect-btn" class="btn btn-primary" disabled>
+              🔍 ตรวจจับขอบ
+            </button>
+            <button id="crop-btn" class="btn btn-success" disabled>
+              ✂️ ตัดเอกสาร
+            </button>
+          </div>
+          <div class="tool-row tool-row-compact">
+            <button id="rotate-left-btn" class="btn btn-secondary" disabled title="หมุนซ้าย 90°">
+              ↺ หมุนซ้าย
+            </button>
+            <button id="rotate-right-btn" class="btn btn-secondary" disabled title="หมุนขวา 90°">
+              ↻ หมุนขวา
+            </button>
+            <button id="use-full-btn" class="btn btn-secondary" disabled title="ใช้ภาพเต็มโดยไม่ต้องตัดขอบ">
+              🖼️ ใช้ทั้งภาพ
+            </button>
+          </div>
         </div>
 
         <p id="image-hint" style="font-size:0.75rem; color:var(--text-muted); margin:10px 0 12px; line-height:1.6">
-          หลังตรวจจับขอบ — ลากจุดสีฟ้า 🔵 เพื่อปรับขอบให้ตรง แล้วกดตัดเอกสาร
+          หลังตรวจจับขอบ — ลากจุดสีฟ้า 🔵 เพื่อปรับขอบแล้วกดตัดเอกสาร หรือกด "ใช้ทั้งภาพ" / "เริ่ม OCR" ได้เลย
         </p>
 
         <!-- PDF Page Navigation (pdf mode) -->
@@ -225,8 +238,40 @@
 
         <hr class="divider" />
 
-        <!-- OCR Mode Selector -->
+        <!-- OCR Engine Selector -->
         <div style="margin-bottom:12px">
+          <div style="font-size:0.78rem; color:var(--text-secondary); margin-bottom:8px; font-weight:600">⚙️ ระบบอ่านข้อความ:</div>
+          <div class="ocr-engine-toggle" role="group" aria-label="เลือกระบบอ่านข้อความ">
+            <button type="button" class="ocr-engine-btn" data-engine="ai" id="engine-ai-btn">
+              ✨ AI OCR (Gemini)
+              <span class="engine-badge">แม่นยำสูง · ลายมือ</span>
+            </button>
+            <button type="button" class="ocr-engine-btn active" data-engine="tesseract" id="engine-tess-btn">
+              🤖 OCR ปกติ (Tesseract)
+              <span class="engine-badge">ฟรีไม่ต้องใช้ Key</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Gemini AI Config Panel (shown when AI OCR selected) -->
+        <div id="ai-config-panel" class="ai-config-panel" style="display:none">
+          <div class="ai-config-header">
+            <span>🔑 Gemini API Key</span>
+            <span id="ai-key-status" class="ai-key-status missing">⚠️ ยังไม่ได้ใส่ Key</span>
+          </div>
+          <div class="ai-key-row">
+            <input type="password" id="gemini-key-input" class="ai-key-input" placeholder="วาง Gemini API Key (AIza...)" autocomplete="off" />
+            <button type="button" id="toggle-key-btn" class="btn btn-secondary ai-icon-btn" title="แสดง/ซ่อน Key">👁️</button>
+            <button type="button" id="save-key-btn" class="btn btn-primary ai-save-btn">💾 บันทึก</button>
+            <button type="button" id="clear-key-btn" class="btn btn-danger ai-icon-btn" title="ลบ Key" style="display:none">🗑️</button>
+          </div>
+          <p class="ai-config-hint">
+            รับ Key ฟรีได้ที่ <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">Google AI Studio</a> · Key ถูกเก็บเฉพาะในเครื่องของคุณเท่านั้น
+          </p>
+        </div>
+
+        <!-- OCR Mode Selector (Tesseract only) -->
+        <div id="tesseract-mode-wrap" style="margin-bottom:12px">
           <div style="font-size:0.78rem; color:var(--text-secondary); margin-bottom:8px; font-weight:600">🎯 โหมด OCR:</div>
           <div class="ocr-mode-toggle" role="group" aria-label="เลือกโหมด OCR">
             <button class="ocr-mode-btn active" data-mode="auto" title="เลือกอัตโนมัติตามภาพ">🔄 อัตโนมัติ</button>

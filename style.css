@@ -1111,3 +1111,157 @@ hr.divider {
   color: var(--accent-primary);
   font-weight: 600;
 }
+
+.tool-row-compact .btn {
+  padding: 7px 10px;
+  font-size: 0.76rem;
+  min-height: 36px;
+}
+
+/* ═══════════════════════════════
+   OCR ENGINE & GEMINI AI PANEL
+═══════════════════════════════ */
+.ocr-engine-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.ocr-engine-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 10px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-family: inherit;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255,255,255,0.03);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition);
+  text-align: left;
+}
+
+.ocr-engine-btn:hover {
+  background: rgba(255,255,255,0.07);
+  border-color: var(--border-active);
+  color: var(--text-primary);
+}
+
+.ocr-engine-btn.active {
+  background: rgba(99, 179, 237, 0.16);
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+  box-shadow: 0 0 0 1px rgba(99, 179, 237, 0.25);
+}
+
+.ocr-engine-btn .engine-badge {
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.ocr-engine-btn.active .engine-badge {
+  color: var(--accent-primary);
+}
+
+.ai-config-panel {
+  margin-bottom: 12px;
+  padding: 12px;
+  border-radius: var(--radius-md);
+  background: rgba(99, 179, 237, 0.06);
+  border: 1px solid rgba(99, 179, 237, 0.22);
+}
+
+.ai-config-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.ai-key-status {
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.ai-key-status.ready {
+  background: rgba(104, 211, 145, 0.15);
+  color: var(--accent-green);
+}
+
+.ai-key-status.missing {
+  background: rgba(246, 173, 85, 0.15);
+  color: var(--accent-orange);
+}
+
+.ai-key-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.ai-key-input {
+  flex: 1;
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(10, 13, 20, 0.7);
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  font-family: inherit;
+}
+
+.ai-key-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.ai-icon-btn {
+  flex: 0 0 auto !important;
+  min-height: 38px !important;
+  padding: 0 10px !important;
+}
+
+.ai-save-btn {
+  flex: 0 0 auto !important;
+  min-height: 38px !important;
+  padding: 0 12px !important;
+  font-size: 0.78rem !important;
+}
+
+.ai-config-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
+.ai-config-hint a {
+  color: var(--accent-primary);
+  text-decoration: underline;
+}
+
+@media (max-width: 600px) {
+  .ocr-engine-toggle {
+    grid-template-columns: 1fr;
+  }
+  .ai-key-row {
+    flex-wrap: wrap;
+  }
+  .ai-key-input {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+}

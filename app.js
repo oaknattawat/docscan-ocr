@@ -22,6 +22,9 @@
   const croppedCanvas    = $('cropped-canvas');
   const detectBtn        = $('detect-btn');
   const cropBtn          = $('crop-btn');
+  const rotateLeftBtn    = $('rotate-left-btn');
+  const rotateRightBtn   = $('rotate-right-btn');
+  const useFullBtn       = $('use-full-btn');
   const resetBtn         = $('reset-btn');
   const ocrBtn           = $('ocr-btn');
   const copyBtn          = $('copy-btn');
@@ -39,6 +42,14 @@
   const originalPlaceholder = $('original-placeholder');
   const croppedPlaceholder  = $('cropped-placeholder');
   const langBtns         = document.querySelectorAll('.lang-btn');
+  const ocrEngineBtns    = document.querySelectorAll('.ocr-engine-btn');
+  const aiConfigPanel    = $('ai-config-panel');
+  const tesseractModeWrap = $('tesseract-mode-wrap');
+  const geminiKeyInput   = $('gemini-key-input');
+  const toggleKeyBtn     = $('toggle-key-btn');
+  const saveKeyBtn       = $('save-key-btn');
+  const clearKeyBtn      = $('clear-key-btn');
+  const aiKeyStatus      = $('ai-key-status');
   const ocrModeBtns      = document.querySelectorAll('.ocr-mode-btn');
   const ocrModeDesc      = $('ocr-mode-desc');
   const confidenceBadge  = $('confidence-badge');
@@ -69,6 +80,8 @@
   let structuredSections = null;
   let ocrWorkerReady = false;
   let selectedLang = 'tha+eng';
+  let selectedEngine = localStorage.getItem('docscan_ocr_engine') || (localStorage.getItem('docscan_gemini_api_key') ? 'ai' : 'tesseract');
+  let geminiApiKey = localStorage.getItem('docscan_gemini_api_key') || '';
   let cameraStream = null;
   // PDF-specific
   let pdfDoc = null;        // DocumentLoader PDF object
@@ -115,10 +128,13 @@
     const isImage = fileMode === 'image';
     const isPdf   = fileMode === 'pdf';
     // Image mode buttons
-    detectBtn.disabled = isImage ? (state === 'idle') : true;
-    cropBtn.disabled   = isImage ? (state !== 'detected' && state !== 'cropped') : true;
-    // OCR button: image (cropped/done) or pdf-ocr
-    ocrBtn.disabled    = isImage ? (state !== 'cropped' && state !== 'done')
+    detectBtn.disabled      = isImage ? (state === 'idle') : true;
+    cropBtn.disabled        = isImage ? (state !== 'detected' && state !== 'cropped') : true;
+    if (rotateLeftBtn)  rotateLeftBtn.disabled  = isImage ? (state === 'idle') : true;
+    if (rotateRightBtn) rotateRightBtn.disabled = isImage ? (state === 'idle') : true;
+    if (useFullBtn)     useFullBtn.disabled     = isImage ? (state === 'idle') : true;
+    // OCR button: allow running directly after image load (uses full-res loadedImage if not cropped)
+    ocrBtn.disabled    = isImage ? (state === 'idle')
                        : isPdf   ? (state === 'idle')
                        : true; // docx uses its own button
     copyBtn.disabled     = (state !== 'done');
@@ -142,8 +158,87 @@
   }
 
   // ════════════════════════════════════════════════════════════
-  // LANGUAGE & OCR MODE TOGGLE
+  // LANGUAGE, ENGINE & OCR MODE TOGGLE
   // ════════════════════════════════════════════════════════════
+  function syncEngineUI() {
+    ocrEngineBtns.forEach(b => {
+      b.classList.toggle('active', b.dataset.engine === selectedEngine);
+    });
+    const isAI = selectedEngine === 'ai';
+    if (aiConfigPanel) aiConfigPanel.style.display = isAI ? 'block' : 'none';
+    if (tesseractModeWrap) tesseractModeWrap.style.display = isAI ? 'none' : 'block';
+    if (ocrBtn) {
+      ocrBtn.textContent = isAI ? '✨ เริ่ม AI OCR อ่านข้อความ' : '🤖 เริ่ม OCR อ่านข้อความ';
+    }
+    if (pdfOcrBtn) {
+      pdfOcrBtn.textContent = isAI ? '✨ AI OCR (สแกน)' : '🤖 OCR (ภาพสแกน)';
+    }
+    syncApiKeyUI();
+  }
+
+  function syncApiKeyUI() {
+    const hasKey = Boolean(geminiApiKey && geminiApiKey.trim().length > 0);
+    if (geminiKeyInput && geminiKeyInput.value !== geminiApiKey) {
+      geminiKeyInput.value = geminiApiKey;
+    }
+    if (aiKeyStatus) {
+      aiKeyStatus.textContent = hasKey ? '✅ พร้อมใช้งาน' : '⚠️ ยังไม่ได้ใส่ Key';
+      aiKeyStatus.className = `ai-key-status ${hasKey ? 'ready' : 'missing'}`;
+    }
+    if (clearKeyBtn) {
+      clearKeyBtn.style.display = hasKey ? 'inline-flex' : 'none';
+    }
+  }
+
+  ocrEngineBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      selectedEngine = btn.dataset.engine === 'ai' ? 'ai' : 'tesseract';
+      localStorage.setItem('docscan_ocr_engine', selectedEngine);
+      syncEngineUI();
+      showToast(
+        selectedEngine === 'ai'
+          ? 'เปลี่ยนเป็น ✨ AI OCR (Gemini)'
+          : 'เปลี่ยนเป็น 🤖 OCR ปกติ (Tesseract)',
+        'info',
+        2000
+      );
+    });
+  });
+
+  if (toggleKeyBtn && geminiKeyInput) {
+    toggleKeyBtn.addEventListener('click', () => {
+      const showing = geminiKeyInput.type === 'text';
+      geminiKeyInput.type = showing ? 'password' : 'text';
+      toggleKeyBtn.textContent = showing ? '👁️' : '🙈';
+    });
+  }
+
+  if (saveKeyBtn && geminiKeyInput) {
+    saveKeyBtn.addEventListener('click', () => {
+      const val = geminiKeyInput.value.trim();
+      if (!val) {
+        showToast('กรุณาวาง Gemini API Key ก่อนบันทึก', 'error');
+        return;
+      }
+      geminiApiKey = val;
+      localStorage.setItem('docscan_gemini_api_key', geminiApiKey);
+      syncApiKeyUI();
+      showToast('บันทึก Gemini API Key เรียบร้อย ✅', 'success');
+    });
+  }
+
+  if (clearKeyBtn) {
+    clearKeyBtn.addEventListener('click', () => {
+      geminiApiKey = '';
+      localStorage.removeItem('docscan_gemini_api_key');
+      if (geminiKeyInput) geminiKeyInput.value = '';
+      syncApiKeyUI();
+      showToast('ลบ Gemini API Key แล้ว', 'info');
+    });
+  }
+
+  syncEngineUI();
+
   langBtns.forEach(btn => {
     btn.addEventListener('click', () => {
       langBtns.forEach(b => b.classList.remove('active'));
@@ -258,7 +353,7 @@
       await displayOriginal(loadedImage);
       state = 'loaded';
       updateButtons();
-      setStatus('ready', 'โหลดภาพสำเร็จ — กด "ตรวจจับขอบ" หรือปรับจุดเอง');
+      setStatus('ready', 'โหลดภาพสำเร็จ — กด "ตรวจจับขอบ" หรือ "เริ่ม OCR" ได้เลย');
       showToast('โหลดภาพสำเร็จ ✨', 'success', 2500);
     } catch (err) {
       setStatus('error', 'โหลดภาพล้มเหลว');
@@ -529,9 +624,19 @@
     });
   }
 
+  function isMobileDevice() {
+    return /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent)
+      || (navigator.maxTouchPoints > 1 && window.innerWidth <= 900);
+  }
+
   async function openCamera() {
-    // On mobile HTTP LAN or unsupported browsers, navigator.mediaDevices is unavailable;
-    // fall back to native OS camera input (<input capture="environment">).
+    // On mobile, native OS camera (<input capture="environment">) yields full-res autofocus HDR photos,
+    // which produce far cleaner Thai OCR than compressed WebRTC <video> frames.
+    if (isMobileDevice() && cameraInput) {
+      cameraInput.click();
+      return;
+    }
+
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       if (cameraInput) {
         cameraInput.click();
@@ -543,7 +648,7 @@
 
     try {
       cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } }
       });
       cameraVideo.srcObject = cameraStream;
       cameraModal.classList.add('open');
@@ -611,6 +716,54 @@
     });
   }
 
+  function renderCroppedPreview(resultCanvas) {
+    croppedCanvasData = resultCanvas;
+    const ctx = croppedCanvas.getContext('2d');
+    const MAX_W = croppedCanvas.parentElement?.clientWidth || 600;
+    const scale = Math.min(MAX_W / resultCanvas.width, 460 / resultCanvas.height, 1);
+    croppedCanvas.width  = Math.round(resultCanvas.width  * scale);
+    croppedCanvas.height = Math.round(resultCanvas.height * scale);
+    ctx.drawImage(resultCanvas, 0, 0, croppedCanvas.width, croppedCanvas.height);
+    showCanvas('cropped-canvas', 'cropped-placeholder');
+  }
+
+  async function rotateLoadedImage(degrees) {
+    if (!loadedImage) return;
+    setStatus('loading', 'กำลังหมุนภาพ...');
+    try {
+      loadedImage = await Scanner.rotateImage(loadedImage, degrees);
+      await displayOriginal(loadedImage);
+      const ctxC = croppedCanvas.getContext('2d');
+      ctxC.clearRect(0, 0, croppedCanvas.width, croppedCanvas.height);
+      croppedCanvas.width = 0;
+      hideCanvas('cropped-canvas', 'cropped-placeholder');
+      state = 'loaded';
+      updateButtons();
+      setStatus('ready', 'หมุนภาพสำเร็จ — กด "ตรวจจับขอบ" หรือ "เริ่ม OCR" ได้เลย');
+    } catch (err) {
+      setStatus('error', 'หมุนภาพล้มเหลว');
+      showToast('ไม่สามารถหมุนภาพได้: ' + err.message, 'error');
+    }
+  }
+
+  if (rotateLeftBtn)  rotateLeftBtn.addEventListener('click', () => rotateLoadedImage(-90));
+  if (rotateRightBtn) rotateRightBtn.addEventListener('click', () => rotateLoadedImage(90));
+  if (useFullBtn) {
+    useFullBtn.addEventListener('click', () => {
+      if (!loadedImage) return;
+      const fullCanvas = document.createElement('canvas');
+      fullCanvas.width  = loadedImage.naturalWidth || loadedImage.width;
+      fullCanvas.height = loadedImage.naturalHeight || loadedImage.height;
+      fullCanvas.getContext('2d').drawImage(loadedImage, 0, 0);
+      renderCroppedPreview(fullCanvas);
+      state = 'cropped';
+      updateButtons();
+      setStatus('ready', 'ใช้ภาพเต็มแล้ว — กด "เริ่ม OCR" เพื่ออ่านข้อความ');
+      showToast('ใช้ภาพเต็มเรียบร้อย 🖼️', 'success', 2000);
+      ocrCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  }
+
   // ════════════════════════════════════════════════════════════
   // CROP / WARP
   // ════════════════════════════════════════════════════════════
@@ -625,17 +778,7 @@
 
     try {
       const result = Scanner.warpPerspective(loadedImage, currentCorners);
-      croppedCanvasData = result;
-
-      // Display in cropped canvas
-      const ctx = croppedCanvas.getContext('2d');
-      const MAX_W = croppedCanvas.parentElement?.clientWidth || 600;
-      const scale = Math.min(MAX_W / result.width, 460 / result.height, 1);
-      croppedCanvas.width  = Math.round(result.width  * scale);
-      croppedCanvas.height = Math.round(result.height * scale);
-      ctx.drawImage(result, 0, 0, croppedCanvas.width, croppedCanvas.height);
-
-      showCanvas('cropped-canvas', 'cropped-placeholder');
+      renderCroppedPreview(result);
       state = 'cropped';
       updateButtons();
       setStatus('ready', 'ตัดเอกสารสำเร็จ — กด "เริ่ม OCR" เพื่ออ่านข้อความ');
@@ -656,12 +799,29 @@
   ocrBtn.addEventListener('click', runOCR);
 
   async function runOCR() {
-    const source = croppedCanvasData || originalCanvas;
+    const source = croppedCanvasData || loadedImage || originalCanvas;
     if (!source) return;
 
-    setStatus('loading', 'กำลังเตรียม OCR engine...');
+    const useAI = selectedEngine === 'ai';
+    if (useAI) {
+      const inputKey = geminiKeyInput ? geminiKeyInput.value.trim() : '';
+      const activeKey = inputKey || geminiApiKey;
+      if (!activeKey) {
+        showToast('กรุณาใส่ Gemini API Key ก่อนเริ่ม AI OCR', 'error', 4000);
+        if (aiConfigPanel) aiConfigPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        geminiKeyInput?.focus();
+        return;
+      }
+      if (inputKey && inputKey !== geminiApiKey) {
+        geminiApiKey = inputKey;
+        localStorage.setItem('docscan_gemini_api_key', geminiApiKey);
+        syncApiKeyUI();
+      }
+    }
+
+    setStatus('loading', useAI ? 'กำลังส่งภาพให้ AI อ่านข้อความ...' : 'กำลังเตรียม OCR engine...');
     ocrBtn.disabled = true;
-    setProgress(5, 'กำลังเตรียม OCR engine...');
+    setProgress(5, useAI ? 'กำลังเตรียมภาพสำหรับ AI...' : 'กำลังเตรียม OCR engine...');
 
     // Render skeleton while loading
     showSkeleton();
@@ -672,23 +832,44 @@
         else setProgress(null, label || 'กำลังประมวลผล...');
       };
 
-      await OCREngine.init(selectedLang, progressCb);
+      let allText = '';
+      let linesCount = 0;
+      let avgConf = 0;
+      let modeLabel = '';
 
-      setProgress(10, 'กำลังวิเคราะห์ภาพ...');
-      setStatus('loading', 'กำลังอ่านข้อความ...');
+      if (useAI) {
+        const aiResult = await OCREngine.recognizeWithAI(source, {
+          apiKey: geminiApiKey,
+          lang: selectedLang,
+          onProgress: progressCb,
+        });
+        structuredSections = aiResult.sections;
+        allText = aiResult.text || '';
+        linesCount = aiResult.lineCount || 0;
+        avgConf = aiResult.confidence || 98;
+        modeLabel = `✨ ${aiResult.model}`;
+      } else {
+        await OCREngine.init(selectedLang, progressCb);
 
-      const ocrData = await OCREngine.recognize(source, progressCb);
+        setProgress(10, 'กำลังวิเคราะห์ภาพ...');
+        setStatus('loading', 'กำลังอ่านข้อความ...');
 
-      setProgress(95, 'กำลังจัดโครงสร้างข้อความ...');
+        const ocrData = await OCREngine.recognize(source, progressCb);
 
-      // Structure text
-      structuredSections = OCREngine.structureText(ocrData);
+        setProgress(95, 'กำลังจัดโครงสร้างข้อความ...');
+
+        // Structure text
+        structuredSections = OCREngine.structureText(ocrData);
+        allText = ocrData.text || '';
+        linesCount = (ocrData.lines || []).length;
+        avgConf = Math.round(ocrData.confidence || 0);
+        modeLabel = OCREngine.MODE_CONFIG[ocrData._ocrMode]?.label || '';
+      }
 
       // Render result
       OCREngine.renderToDOM(structuredSections, resultBody);
 
       // Update stats (use Intl.Segmenter for accurate Thai word counting when supported)
-      const allText = ocrData.text || '';
       let words = 0;
       if (typeof Intl !== 'undefined' && Intl.Segmenter) {
         const seg = new Intl.Segmenter('th', { granularity: 'word' });
@@ -698,20 +879,19 @@
       } else {
         words = allText.trim().split(/\s+/).filter(Boolean).length;
       }
-      const linesCount = (ocrData.lines || []).length;
-      const avgConf = Math.round(ocrData.confidence || 0);
-      const modeLabel = OCREngine.MODE_CONFIG[ocrData._ocrMode]?.label || '';
 
       wordCountEl.textContent = words.toLocaleString();
       lineCountEl.textContent = linesCount.toLocaleString();
 
-      confidenceBadge.textContent = `ความแม่นยำ ${avgConf}%${modeLabel ? ' · ' + modeLabel : ''}`;
+      confidenceBadge.textContent = useAI
+        ? `${modeLabel} · ความแม่นยำสูง`
+        : `ความแม่นยำ ${avgConf}%${modeLabel ? ' · ' + modeLabel : ''}`;
       confidenceBadge.className = `confidence-badge ${avgConf >= 80 ? 'confidence-high' : avgConf >= 60 ? 'confidence-mid' : 'confidence-low'}`;
 
       state = 'done';
       updateButtons();
       hideProgress();
-      setStatus('ready', `OCR เสร็จสิ้น (${modeLabel || 'auto'}) — พบ ${words} คำ ใน ${linesCount} บรรทัด`);
+      setStatus('ready', `${useAI ? 'AI OCR' : 'OCR'} เสร็จสิ้น (${modeLabel || 'auto'}) — พบ ${words} คำ ใน ${linesCount} บรรทัด`);
       showToast('อ่านข้อความสำเร็จ 🎉', 'success');
 
       // Scroll to result
@@ -824,6 +1004,7 @@
     confidenceBadge.className = 'confidence-badge';
 
     fileInput.value = '';
+    if (cameraInput) cameraInput.value = '';
     hideProgress();
     setStatus('', 'รอภาพเอกสาร...');
     updateButtons();
