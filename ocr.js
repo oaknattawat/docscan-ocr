@@ -734,10 +734,12 @@ const OCREngine = (() => {
 
     // Filter short lines with low confidence or mostly garbage symbols
     const symbolRatio = 1 - (alnumMatches.length / t.length);
-    if (t.length <= 6 && conf > 0 && conf < 45 && symbolRatio > 0.3) return true;
-    if (symbolRatio > 0.65 && conf > 0 && conf < 60) return true;
+    if (t.length <= 6 && conf > 0 && conf < 50 && symbolRatio > 0.25) return true;
+    if (symbolRatio > 0.55 && conf > 0 && conf < 65) return true;
+    // High symbol ratio regardless of confidence = noise
+    if (symbolRatio > 0.75) return true;
 
-    // Thai syllables can never start with trailing/combining marks (ะ ั า ำ ิ ี ึ ื ุ ู ฺ ๆ ็ ่ ้ ๊ ๋ ์)
+    // Thai syllables can never start with trailing/combining marks
     const startsWithThaiNonStarter = /^[\u0E30-\u0E3A\u0E45-\u0E4E]/.test(t);
     const tokens = t.split(/\s+/).filter(Boolean);
     const avgTokLen = tokens.length ? tokens.reduce((s, tok) => s + tok.length, 0) / tokens.length : t.length;
@@ -746,18 +748,41 @@ const OCREngine = (() => {
       return true;
     }
 
-    // Filter fragmented screen/texture hallucinations (e.g. "v - a »v", "๑ | จ v ๑", "ซ ๕", "ชู ๕")
-    if (conf > 0 && conf < 55 && t.length <= 18) {
-      const singleTokens = tokens.filter(tok => tok.length === 1).length;
-      if (tokens.length >= 2 && singleTokens / tokens.length >= 0.6 && !/^\d+$/.test(tokens[0])) {
-        return true;
-      }
-      if (/[\u0E50-\u0E59]/.test(t) && tokens.length >= 2) {
-        return true;
-      }
+    // Filter single-char soup: "v - a +", "A a c", token avg length too small
+    const singleCharTokens = tokens.filter(tok => tok.length === 1).length;
+    if (tokens.length >= 2 && singleCharTokens / tokens.length >= 0.5 && !/^\d+$/.test(tokens[0])) {
+      if (conf < 75 || t.length <= 20) return true;
     }
 
-    // Filter tiny isolated non-word margin specks (e.g. "4%", "otal" at low confidence)
+    // Mostly tiny (<=2 char) tokens at low confidence: "od a", "v a +"
+    const shortTokens = tokens.filter(tok => tok.length <= 2).length;
+    if (tokens.length >= 2 && shortTokens / tokens.length >= 0.65 && conf > 0 && conf < 70 && t.length <= 20) {
+      return true;
+    }
+
+    // Lines starting or ending with non-word symbol: "~ ยะขับ °", '" A a ๕'
+    if (conf > 0 && conf < 65 && t.length <= 20) {
+      if (/^[^\u0E00-\u0E7FA-Za-z0-9]/.test(t) || /[^\u0E00-\u0E7FA-Za-z0-9]$/.test(t)) {
+        if (symbolRatio > 0.15) return true;
+      }
+      // Thai digits mixed in with other chars
+      if (/[\u0E50-\u0E59]/.test(t) && tokens.length >= 2) return true;
+    }
+
+    // Very short Thai with tone marks = syllable splinter (ข่, ข่ม, ส่, ชิ, ศัณ)
+    // Allow meaningful short words
+    const shortThaiAllow = /^(โดย|หน้า|สรุป|บทนำ|บทที่|ทำ|ให้|ได้|ไม่|สิ้น|จบ|การ|รูป|หัว|ผล|มี)$/.test(t);
+    if (!shortThaiAllow && t.length <= 5 && conf > 0 && conf < 72 && /[\u0E00-\u0E7F]/.test(t)) {
+      if (/[\u0E48-\u0E4B]/.test(t)) return true; // contains tone mark (่ ้ ๊ ๋)
+      if (t.length <= 3 && conf < 60) return true; // ultra-short at low conf
+    }
+
+    // Pure short Latin garbage at low confidence: "od", "vn", "[J"
+    if (conf > 0 && conf < 65 && t.length <= 6 && tokens.length <= 2) {
+      if (/^[A-Za-z\[\]{}()\s]{1,6}$/.test(t) && !/^(the|and|of|to|is|in|OCR|PDF|ID)$/i.test(t)) return true;
+    }
+
+    // Speck: single short token not in allowlist
     if (conf > 0 && conf < 55 && t.length <= 5 && tokens.length === 1 && !/^(โดย|บทนำ|สรุป|หน้า|\d+\.?)$/.test(t)) {
       return true;
     }
