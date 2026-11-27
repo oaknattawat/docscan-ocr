@@ -1173,7 +1173,36 @@ const OCREngine = (() => {
   // GEMINI AI VISION OCR (HIGH-ACCURACY / HANDWRITING / MIND MAP)
   // ══════════════════════════════════════════════════════════════
 
-  const AI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+  const AI_MODELS = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-flash-latest'];
+
+  async function discoverGeminiFlashModels(apiKey) {
+    try {
+      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+        headers: { 'x-goog-api-key': apiKey },
+      });
+      if (!res.ok) return [];
+      const data = await res.json();
+      const models = (data.models || [])
+        .filter((m) =>
+          Array.isArray(m.supportedGenerationMethods) &&
+          m.supportedGenerationMethods.includes('generateContent') &&
+          /gemini/i.test(m.name) &&
+          !/embedding|tts|aqa|imagen|veo|audio/i.test(m.name)
+        )
+        .map((m) => m.name.replace(/^models\//, ''));
+
+      // Prefer flash models, newest version numbers first
+      models.sort((a, b) => {
+        const aFlash = /flash/i.test(a) ? 1 : 0;
+        const bFlash = /flash/i.test(b) ? 1 : 0;
+        if (aFlash !== bFlash) return bFlash - aFlash;
+        return b.localeCompare(a, undefined, { numeric: true });
+      });
+      return models;
+    } catch (_) {
+      return [];
+    }
+  }
 
   function imageSourceToJpegBase64(imageSource, maxDim = 2048) {
     const srcCanvas = getSourceCanvas(imageSource);
@@ -1330,10 +1359,17 @@ const OCREngine = (() => {
       },
     };
 
+    const tried = new Set();
+    const queue = [...AI_MODELS];
+    let discovered = false;
     let lastError = null;
-    for (let i = 0; i < AI_MODELS.length; i++) {
-      const model = AI_MODELS[i];
-      onProgress?.(35 + i * 15, `กำลังส่งให้ AI (${model}) อ่านข้อความ...`);
+
+    while (queue.length > 0) {
+      const model = queue.shift();
+      if (!model || tried.has(model)) continue;
+      tried.add(model);
+
+      onProgress?.(Math.min(75, 30 + tried.size * 12), `กำลังส่งให้ AI (${model}) อ่านข้อความ...`);
 
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
       const res = await fetch(endpoint, {
@@ -1378,10 +1414,28 @@ const OCREngine = (() => {
         errMsg = errJson?.error?.message || errMsg;
       } catch (_) {}
 
-      if (res.status === 404 && i < AI_MODELS.length - 1) {
+      const isModelUnavailable =
+        res.status === 404 ||
+        /no longer available|not found|not supported for generateContent|deprecated/i.test(errMsg);
+
+      if (isModelUnavailable) {
         lastError = new Error(errMsg);
+        // If API error explicitly recommends a replacement model (e.g. models/gemini-3.8-flash), try it next
+        const recMatch = errMsg.match(/models\/(gemini-[a-z0-9.\-]+)/i);
+        if (recMatch && !tried.has(recMatch[1])) {
+          queue.unshift(recMatch[1]);
+        }
+        // If queue is empty and we haven't queried /v1beta/models yet, auto-discover active models
+        if (queue.length === 0 && !discovered) {
+          discovered = true;
+          const liveModels = await discoverGeminiFlashModels(cleanKey);
+          liveModels.slice(0, 3).forEach((m) => {
+            if (!tried.has(m)) queue.push(m);
+          });
+        }
         continue;
       }
+
       if (res.status === 400 || res.status === 401 || res.status === 403) {
         throw new Error(`Gemini API Key ไม่ถูกต้องหรือไม่มีสิทธิ์ใช้งาน (${errMsg})`);
       }
