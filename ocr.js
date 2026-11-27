@@ -769,6 +769,9 @@ const OCREngine = (() => {
       if (/[\u0E50-\u0E59]/.test(t) && tokens.length >= 2) return true;
     }
 
+    // Linguistically impossible standalone 2-char Thai: 1 consonant + tone mark/karan with no vowel (e.g. "ข่", "ส่")
+    if (/^[\u0E01-\u0E2E][\u0E48-\u0E4C]$/.test(t)) return true;
+
     // Very short Thai with tone marks = syllable splinter (ข่, ข่ม, ส่, ชิ, ศัณ)
     // Allow meaningful short words
     const shortThaiAllow = /^(โดย|หน้า|สรุป|บทนำ|บทที่|ทำ|ให้|ได้|ไม่|สิ้น|จบ|การ|รูป|หัว|ผล|มี)$/.test(t);
@@ -1418,13 +1421,19 @@ const OCREngine = (() => {
     if (!hasAnyHeading) {
       let h1Done = false;
       let h2Count = 0;
+      let sawLongProse = false;
+      const endsWithContinuationRe = /(?:และ|หรือ|โดย|ที่|ซึ่ง|เพื่อ|สำหรับ|แต่|กับ|จาก|ใน|ของ|ได้|จะ|ต้อง|เป็น|ให้|ว่า)$/;
       working = working.map((s, idx) => {
         if (s.type !== 'body') return s;
         const txt = (s.text || '').trim();
+        const prevTxt = idx > 0 ? (working[idx - 1].text || '').trim() : '';
+        const prevEndsWithContinuation = endsWithContinuationRe.test(prevTxt);
         const singleLine = !txt.includes('\n');
         const noEndPunct = !/[.,;:!]$/.test(txt);
         const noChildren = s.children.length === 0;
-        if (
+        const canPromote =
+          !sawLongProse &&
+          !prevEndsWithContinuation &&
           idx <= 3 &&
           singleLine &&
           noEndPunct &&
@@ -1433,8 +1442,14 @@ const OCREngine = (() => {
           txt.length <= 68 &&
           isValidHeadingCandidate(txt, s.confidence ?? 0) &&
           !isProseOrMetadata(txt) &&
-          !/^\d+[.)]\s/.test(txt)
-        ) {
+          !/^\d+[.)]\s/.test(txt) &&
+          !/^(แบ่งเป็น|งานได้|และ|หรือ|โดย|แต่|ซึ่ง|เพื่อ|สำหรับ)/.test(txt);
+
+        if (txt.includes('\n') || txt.length > 90) {
+          sawLongProse = true;
+        }
+
+        if (canPromote) {
           if (!h1Done) {
             h1Done = true;
             return { ...s, type: 'h1' };
