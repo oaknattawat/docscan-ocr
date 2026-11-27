@@ -14,19 +14,104 @@ const Scanner = (() => {
   let dragIndex = -1;
   let displayScale = { x: 1, y: 1 };
 
-  // ── Load image from File ──────────────────────────────────────
-  function loadImageFile(file) {
+  const MAX_IMAGE_DIM = 3000;
+
+  // ── Convert Canvas to ImageElement cleanly ────────────────────
+  function canvasToImage(canvas) {
     return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error('ไม่สามารถแปลงภาพได้'));
+          return;
+        }
+        const url = URL.createObjectURL(blob);
         const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = reject;
-        img.src = e.target.result;
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
+        img.onload = () => {
+          URL.revokeObjectURL(url);
+          resolve(img);
+        };
+        img.onerror = (e) => {
+          URL.revokeObjectURL(url);
+          reject(e);
+        };
+        img.src = url;
+      }, 'image/jpeg', 0.94);
     });
+  }
+
+  // ── Load image from File (EXIF-safe & mobile RAM-safe) ────────
+  async function loadImageFile(file) {
+    // Prefer createImageBitmap with explicit EXIF orientation handling on mobile
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+        const sw = bitmap.width;
+        const sh = bitmap.height;
+        const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(sw, sh));
+        const dw = Math.max(1, Math.round(sw * scale));
+        const dh = Math.max(1, Math.round(sh * scale));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = dw;
+        canvas.height = dh;
+        const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(bitmap, 0, 0, dw, dh);
+        bitmap.close?.();
+        return await canvasToImage(canvas);
+      } catch (err) {
+        console.warn('createImageBitmap fallback:', err);
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = async () => {
+        URL.revokeObjectURL(url);
+        const sw = img.naturalWidth;
+        const sh = img.naturalHeight;
+        if (Math.max(sw, sh) > MAX_IMAGE_DIM) {
+          const scale = MAX_IMAGE_DIM / Math.max(sw, sh);
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(sw * scale));
+          canvas.height = Math.max(1, Math.round(sh * scale));
+          const ctx = canvas.getContext('2d');
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          try {
+            resolve(await canvasToImage(canvas));
+          } catch (e) {
+            resolve(img);
+          }
+        } else {
+          resolve(img);
+        }
+      };
+      img.onerror = (e) => {
+        URL.revokeObjectURL(url);
+        reject(e);
+      };
+      img.src = url;
+    });
+  }
+
+  // ── Rotate ImageElement by ±90 degrees ────────────────────────
+  async function rotateImage(imgElement, degrees) {
+    const rad = (degrees * Math.PI) / 180;
+    const sw = imgElement.naturalWidth || imgElement.width;
+    const sh = imgElement.naturalHeight || imgElement.height;
+    const swap = Math.abs(degrees) % 180 === 90;
+    const canvas = document.createElement('canvas');
+    canvas.width = swap ? sh : sw;
+    canvas.height = swap ? sw : sh;
+    const ctx = canvas.getContext('2d');
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(imgElement, -sw / 2, -sh / 2);
+    return await canvasToImage(canvas);
   }
 
   // ── Detect document edges using OpenCV.js ─────────────────────
@@ -36,58 +121,54 @@ const Scanner = (() => {
       return getFullImageCorners(canvasEl);
     }
 
-    let src, gray, blurred, edges, contours, hierarchy;
+    let src, gray, blurred, edges, closed, contours, hierarchy, kernel;
     try {
       src = cv.imread(canvasEl);
       gray = new cv.Mat();
       blurred = new cv.Mat();
       edges = new cv.Mat();
+      closed = new cv.Mat();
       contours = new cv.MatVector();
       hierarchy = new cv.Mat();
+      kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
 
-      // Convert to gray
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-      // Gaussian blur
       cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
 
-      // Canny edge detection
-      cv.Canny(blurred, edges, 75, 200);
-
-      // Dilate edges slightly
-      const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-      cv.dilate(edges, edges, kernel);
-      kernel.delete();
-
-      // Find contours
-      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
+      const minArea = src.cols * src.rows * 0.12;
       let bestCorners = null;
       let maxArea = 0;
 
-      for (let i = 0; i < contours.size(); i++) {
-        const cnt = contours.get(i);
-        const area = cv.contourArea(cnt);
-        const peri = cv.arcLength(cnt, true);
-        const approx = new cv.Mat();
-        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+      // Try two edge sensitivity passes to handle soft paper edges on mobile photos
+      const thresholds = [[50, 150], [30, 100]];
+      for (const [t1, t2] of thresholds) {
+        cv.Canny(blurred, edges, t1, t2);
+        cv.morphologyEx(edges, closed, cv.MORPH_CLOSE, kernel);
+        cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        if (approx.rows === 4 && area > maxArea && area > (src.cols * src.rows * 0.05)) {
-          maxArea = area;
-          bestCorners = [];
-          for (let j = 0; j < 4; j++) {
-            bestCorners.push({
-              x: approx.data32S[j * 2],
-              y: approx.data32S[j * 2 + 1]
-            });
+        for (let i = 0; i < contours.size(); i++) {
+          const cnt = contours.get(i);
+          const area = cv.contourArea(cnt);
+          if (area > minArea && area > maxArea) {
+            const peri = cv.arcLength(cnt, true);
+            const approx = new cv.Mat();
+            cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+            if (approx.rows === 4 && cv.isContourConvex(approx)) {
+              maxArea = area;
+              bestCorners = [];
+              for (let j = 0; j < 4; j++) {
+                bestCorners.push({
+                  x: approx.data32S[j * 2],
+                  y: approx.data32S[j * 2 + 1]
+                });
+              }
+            }
+            approx.delete();
           }
+          cnt.delete();
         }
-        approx.delete();
-        cnt.delete();
+        if (bestCorners) break;
       }
-
-      src.delete(); gray.delete(); blurred.delete(); edges.delete();
-      contours.delete(); hierarchy.delete();
 
       if (bestCorners) {
         return sortCorners(bestCorners);
@@ -96,30 +177,22 @@ const Scanner = (() => {
 
     } catch (err) {
       console.error('OpenCV detection error:', err);
-      try { src.delete(); gray.delete(); blurred.delete(); edges.delete(); contours.delete(); hierarchy.delete(); } catch(e){}
       return getFullImageCorners(canvasEl);
+    } finally {
+      try { src?.delete(); gray?.delete(); blurred?.delete(); edges?.delete(); closed?.delete(); contours?.delete(); hierarchy?.delete(); kernel?.delete(); } catch(e){}
     }
   }
 
-  // ── Sort corners: TL, TR, BR, BL ─────────────────────────────
+  // ── Sort corners cleanly: TL, TR, BR, BL ──────────────────────
   function sortCorners(pts) {
-    const center = {
-      x: pts.reduce((s, p) => s + p.x, 0) / pts.length,
-      y: pts.reduce((s, p) => s + p.y, 0) / pts.length,
-    };
-    const tl = pts.filter(p => p.x < center.x && p.y < center.y);
-    const tr = pts.filter(p => p.x >= center.x && p.y < center.y);
-    const br = pts.filter(p => p.x >= center.x && p.y >= center.y);
-    const bl = pts.filter(p => p.x < center.x && p.y >= center.y);
-    const pick = (arr, fallback) => arr.length ? arr[0] : fallback;
-    const w = pts.reduce((m, p) => Math.max(m, p.x), 0);
-    const h = pts.reduce((m, p) => Math.max(m, p.y), 0);
-    return [
-      pick(tl, { x: 0, y: 0 }),
-      pick(tr, { x: w, y: 0 }),
-      pick(br, { x: w, y: h }),
-      pick(bl, { x: 0, y: h }),
-    ];
+    if (!pts || pts.length !== 4) return pts;
+    const bySum = [...pts].sort((a, b) => (a.x + a.y) - (b.x + b.y));
+    const tl = bySum[0];
+    const br = bySum[3];
+    const remaining = [bySum[1], bySum[2]].sort((a, b) => (a.y - a.x) - (b.y - b.x));
+    const tr = remaining[0];
+    const bl = remaining[1];
+    return [tl, tr, br, bl];
   }
 
   // ── Fallback: full image corners ──────────────────────────────
@@ -152,22 +225,30 @@ const Scanner = (() => {
 
   // ── Perspective warp using homography ─────────────────────────
   function warpPerspective(srcImgEl, corners) {
-    if (!window.cv || !window.cv.getPerspectiveTransform) {
-      return warpFallback(srcImgEl, corners);
-    }
-
-    const realCorners = corners.map(c => ({
+    const ordered = sortCorners(corners);
+    const realCorners = ordered.map(c => ({
       x: c.x * displayScale.x,
       y: c.y * displayScale.y,
     }));
 
-    // Compute output dimensions
+    // Compute output dimensions with mobile canvas memory guard
     const widthTop = Math.hypot(realCorners[1].x - realCorners[0].x, realCorners[1].y - realCorners[0].y);
     const widthBot = Math.hypot(realCorners[2].x - realCorners[3].x, realCorners[2].y - realCorners[3].y);
     const heightLeft = Math.hypot(realCorners[3].x - realCorners[0].x, realCorners[3].y - realCorners[0].y);
     const heightRight = Math.hypot(realCorners[2].x - realCorners[1].x, realCorners[2].y - realCorners[1].y);
-    const outW = Math.round(Math.max(widthTop, widthBot));
-    const outH = Math.round(Math.max(heightLeft, heightRight));
+    let outW = Math.max(20, Math.round(Math.max(widthTop, widthBot)));
+    let outH = Math.max(20, Math.round(Math.max(heightLeft, heightRight)));
+
+    const maxOutDim = 2800;
+    if (Math.max(outW, outH) > maxOutDim) {
+      const capScale = maxOutDim / Math.max(outW, outH);
+      outW = Math.max(20, Math.round(outW * capScale));
+      outH = Math.max(20, Math.round(outH * capScale));
+    }
+
+    if (!window.cv || !window.cv.getPerspectiveTransform) {
+      return warpFallback(srcImgEl, ordered);
+    }
 
     // Temp canvas with original image
     const tmpCanvas = document.createElement('canvas');
@@ -176,36 +257,35 @@ const Scanner = (() => {
     const tmpCtx = tmpCanvas.getContext('2d');
     tmpCtx.drawImage(srcImgEl, 0, 0);
 
-    let src, dst, M;
+    let src, dst, M, srcPts, dstPts;
     try {
       src = cv.imread(tmpCanvas);
       dst = new cv.Mat();
 
-      const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
         realCorners[0].x, realCorners[0].y,
         realCorners[1].x, realCorners[1].y,
         realCorners[2].x, realCorners[2].y,
         realCorners[3].x, realCorners[3].y,
       ]);
-      const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
         0, 0, outW, 0, outW, outH, 0, outH,
       ]);
 
       M = cv.getPerspectiveTransform(srcPts, dstPts);
-      cv.warpPerspective(src, dst, M, new cv.Size(outW, outH));
+      cv.warpPerspective(src, dst, M, new cv.Size(outW, outH), cv.INTER_CUBIC);
 
       const outCanvas = document.createElement('canvas');
       outCanvas.width = outW;
       outCanvas.height = outH;
       cv.imshow(outCanvas, dst);
-
-      src.delete(); dst.delete(); M.delete(); srcPts.delete(); dstPts.delete();
       return outCanvas;
 
     } catch (err) {
       console.error('Warp error:', err);
-      try { src.delete(); dst.delete(); M.delete(); } catch (e) {}
-      return warpFallback(srcImgEl, corners);
+      return warpFallback(srcImgEl, ordered);
+    } finally {
+      try { src?.delete(); dst?.delete(); M?.delete(); srcPts?.delete(); dstPts?.delete(); } catch (e) {}
     }
   }
 
@@ -217,15 +297,21 @@ const Scanner = (() => {
     }));
     const xs = realCorners.map(c => c.x);
     const ys = realCorners.map(c => c.y);
-    const minX = Math.min(...xs), maxX = Math.max(...xs);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
-    const w = maxX - minX, h = maxY - minY;
+    const minX = Math.max(0, Math.min(...xs));
+    const maxX = Math.min(srcImgEl.naturalWidth, Math.max(...xs));
+    const minY = Math.max(0, Math.min(...ys));
+    const maxY = Math.min(srcImgEl.naturalHeight, Math.max(...ys));
+    const sw = Math.max(20, maxX - minX);
+    const sh = Math.max(20, maxY - minY);
 
+    const scale = Math.min(1, 2800 / Math.max(sw, sh));
     const outCanvas = document.createElement('canvas');
-    outCanvas.width = w;
-    outCanvas.height = h;
+    outCanvas.width = Math.max(20, Math.round(sw * scale));
+    outCanvas.height = Math.max(20, Math.round(sh * scale));
     const ctx = outCanvas.getContext('2d');
-    ctx.drawImage(srcImgEl, minX, minY, w, h, 0, 0, w, h);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(srcImgEl, minX, minY, sw, sh, 0, 0, outCanvas.width, outCanvas.height);
     return outCanvas;
   }
 
@@ -357,6 +443,7 @@ const Scanner = (() => {
   // ── Public API ────────────────────────────────────────────────
   return {
     loadImageFile,
+    rotateImage,
     detectDocumentCorners,
     setupCanvas,
     warpPerspective,
