@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
+  <meta name="theme-color" content="#0a0d14" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>DocScan OCR — ตัดเอกสารและอ่านข้อความอัตโนมัติ</title>
+  <meta name="description" content="แอปพลิเคชันสำหรับตัดเอกสารอัตโนมัติและอ่านข้อความด้วย OCR รองรับภาษาไทยและอังกฤษ พร้อมแบ่งหัวข้อโดยอัตโนมัติ" />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+
+  <!-- Tesseract.js -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <!-- OpenCV.js (async load) -->
+  <script>
+    var Module = { onRuntimeInitialized: function() { window.cvReady = true; } };
+  </script>
+  <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="window.Module && Module.onRuntimeInitialized && Module.onRuntimeInitialized()"></script>
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- Background -->
+<div class="bg-gradient" aria-hidden="true"></div>
+
+<!-- Toast Container -->
+<div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+<!-- Camera Modal -->
+<div id="camera-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="กล้องถ่ายภาพ">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">📷 ถ่ายภาพเอกสาร</span>
+      <button id="close-camera" class="btn-close" aria-label="ปิด">✕</button>
+    </div>
+    <div class="modal-body">
+      <video id="camera-video" autoplay playsinline muted></video>
+    </div>
+    <div class="modal-footer">
+      <button id="capture-btn" class="btn btn-primary" style="max-width:200px">
+        📸 ถ่ายภาพ
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- App Wrapper -->
+<div class="app-wrapper">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-logo" aria-hidden="true">📄</div>
+    <div class="header-text">
+      <h1>DocScan OCR</h1>
+      <p>ตัดเอกสารอัตโนมัติ &amp; อ่านข้อความด้วย AI · รองรับภาษาไทย &amp; อังกฤษ</p>
+    </div>
+  </header>
+
+  <!-- Main Grid -->
+  <div class="main-grid">
+
+    <!-- ═══ STEP 1: Upload ═══════════════════════════════════ -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <div class="step-badge">1</div>
+          <span class="icon">🖼️</span>
+          <span>อัปโหลด / ถ่ายภาพ</span>
+        </div>
+        <div class="lang-toggle" role="group" aria-label="เลือกภาษา OCR">
+          <button class="lang-btn active" data-lang="tha+eng" title="ไทย + อังกฤษ">ไทย+EN</button>
+          <button class="lang-btn" data-lang="tha" title="ภาษาไทยเท่านั้น">ไทย</button>
+          <button class="lang-btn" data-lang="eng" title="อังกฤษเท่านั้น">EN</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <!-- Upload Zone -->
+        <div id="upload-zone" class="upload-zone" role="button" tabindex="0"
+             aria-label="คลิกหรือลากไฟล์รูปภาพมาวาง">
+          <input type="file" id="file-input"
+            accept="image/*,.pdf,.docx,.doc,.xlsx,.xls,.pptx,.ppt,.odt,.ods,.odp,.txt,.csv,.rtf,.md,.markdown"
+            aria-hidden="true" tabindex="-1" />
+          <span class="upload-icon" aria-hidden="true">📂</span>
+          <div class="upload-title">แตะเพื่อเลือกไฟล์ หรือลากมาวางที่นี่</div>
+          <div class="upload-subtitle">รองรับรูปภาพ กล้องมือถือ และไฟล์เอกสารทุกประเภท</div>
+          <div class="upload-formats">
+            <span class="format-badge format-img">🖼️ JPG/PNG</span>
+            <span class="format-badge format-pdf">📕 PDF</span>
+            <span class="format-badge format-docx">📘 DOCX</span>
+            <span class="format-badge format-xlsx">📗 XLSX</span>
+            <span class="format-badge format-pptx">📙 PPTX</span>
+            <span class="format-badge format-txt">📝 TXT/CSV</span>
+            <span class="format-badge format-odt">📄 ODT/RTF</span>
+          </div>
+        </div>
+
+        <!-- Camera Button -->
+        <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none" aria-hidden="true" />
+        <div class="btn-row" style="margin-top:12px">
+          <button id="camera-btn" class="btn btn-secondary">
+            📷 ถ่ายจากกล้อง
+          </button>
+          <button id="reset-btn" class="btn btn-danger">
+            🗑️ รีเซ็ต
+          </button>
+        </div>
+
+        <!-- Status -->
+        <div class="status-row" style="margin-top:14px">
+          <div id="status-dot" class="status-dot"></div>
+          <span id="status-text" style="color: var(--text-secondary); font-size:0.8rem">รอภาพเอกสาร...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ STEP 2: Detect & Crop ════════════════════════════ -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <div class="step-badge">2</div>
+          <span class="icon">✂️</span>
+          <span id="step2-title">ตรวจจับ &amp; ตัดเอกสาร</span>
+        </div>
+        <!-- File type badge -->
+        <div id="filetype-badge" style="display:none"></div>
+      </div>
+      <div class="card-body">
+
+        <!-- Tool Buttons (image mode) -->
+        <div class="tool-row" id="image-tools">
+          <button id="detect-btn" class="btn btn-primary" disabled>
+            🔍 ตรวจจับขอบ
+          </button>
+          <button id="crop-btn" class="btn btn-success" disabled>
+            ✂️ ตัดเอกสาร
+          </button>
+        </div>
+
+        <p id="image-hint" style="font-size:0.75rem; color:var(--text-muted); margin:10px 0 12px; line-height:1.6">
+          หลังตรวจจับขอบ — ลากจุดสีฟ้า 🔵 เพื่อปรับขอบให้ตรง แล้วกดตัดเอกสาร
+        </p>
+
+        <!-- PDF Page Navigation (pdf mode) -->
+        <div id="pdf-nav" style="display:none; margin-bottom:12px">
+          <div class="pdf-nav-bar">
+            <button id="pdf-prev" class="btn btn-secondary pdf-nav-btn" disabled>‹ ก่อนหน้า</button>
+            <div class="pdf-page-info">
+              <span>หน้า</span>
+              <strong id="pdf-current-page">1</strong>
+              <span>/</span>
+              <strong id="pdf-total-pages">?</strong>
+            </div>
+            <button id="pdf-next" class="btn btn-secondary pdf-nav-btn">ถัดไป ›</button>
+          </div>
+          <!-- PDF action buttons -->
+          <div class="tool-row" style="margin-top:10px">
+            <button id="pdf-extract-btn" class="btn btn-primary" style="flex:2">
+              📄 ดึงข้อความ (เร็ว)
+            </button>
+            <button id="pdf-ocr-btn" class="btn btn-secondary">
+              🤖 OCR (ภาพสแกน)
+            </button>
+          </div>
+          <p style="font-size:0.72rem; color:var(--text-muted); margin:8px 0 0; line-height:1.6">
+            📄 <strong>ดึงข้อความ</strong> — ใช้สำหรับ PDF ดิจิทัล (มีข้อความฝังอยู่) &nbsp;|&nbsp;
+            🤖 <strong>OCR</strong> — ใช้สำหรับ PDF ที่สแกนมาจากกระดาษ
+          </p>
+        </div>
+
+        <!-- DOCX info panel -->
+        <div id="docx-panel" style="display:none; margin-bottom:12px">
+          <div class="file-info-box">
+            <span class="file-info-icon">📘</span>
+            <div>
+              <div style="font-size:0.88rem;font-weight:600;color:var(--accent-primary)" id="docx-panel-title">ไฟล์ Word Document</div>
+              <div style="font-size:0.78rem;color:var(--text-secondary);margin-top:3px" id="docx-panel-desc">สามารถดึงข้อความและโครงสร้างได้โดยตรง ไม่ต้องใช้ OCR</div>
+            </div>
+          </div>
+          <button id="docx-extract-btn" class="btn btn-primary" style="width:100%;margin-top:12px">
+            📘 ดึงข้อความจากไฟล์
+          </button>
+        </div>
+
+        <!-- Original Image Canvas -->
+        <div class="canvas-container" id="original-container" style="position:relative">
+          <div id="original-placeholder" class="canvas-placeholder">
+            <span class="ph-icon">🖼️</span>
+            <span>ภาพต้นฉบับจะแสดงที่นี่</span>
+          </div>
+          <canvas id="original-canvas" style="display:none; position:relative; z-index:1"></canvas>
+          <canvas id="overlay-canvas" style="display:none; z-index:2"></canvas>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══ STEP 2.5: Cropped Preview ══════════════════════════ -->
+    <div class="card" id="ocr-card">
+      <div class="card-header">
+        <div class="card-title">
+          <div class="step-badge">3</div>
+          <span class="icon">🔆</span>
+          <span>ภาพที่ตัดแล้ว</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="confidence-badge" class="confidence-badge"></span>
+        </div>
+      </div>
+      <div class="card-body">
+
+        <!-- Cropped Canvas -->
+        <div class="canvas-container">
+          <div id="cropped-placeholder" class="canvas-placeholder">
+            <span class="ph-icon">✂️</span>
+            <span>ภาพที่ตัดแล้วจะแสดงที่นี่</span>
+          </div>
+          <canvas id="cropped-canvas" style="display:none"></canvas>
+        </div>
+
+        <hr class="divider" />
+
+        <!-- OCR Mode Selector -->
+        <div style="margin-bottom:12px">
+          <div style="font-size:0.78rem; color:var(--text-secondary); margin-bottom:8px; font-weight:600">🎯 โหมด OCR:</div>
+          <div class="ocr-mode-toggle" role="group" aria-label="เลือกโหมด OCR">
+            <button class="ocr-mode-btn active" data-mode="auto" title="เลือกอัตโนมัติตามภาพ">🔄 อัตโนมัติ</button>
+            <button class="ocr-mode-btn" data-mode="document" title="เอกสารพิมพ์ตัวอักษรชัดเจน">📄 เอกสาร</button>
+            <button class="ocr-mode-btn" data-mode="photo" title="ภาพถ่าย/สแกน/Mind Map/ลายมือ">📸 ภาพถ่าย</button>
+            <button class="ocr-mode-btn" data-mode="sparse" title="ข้อความกระจาย/ป้าย/นามบัตร">🔍 กระจาย</button>
+          </div>
+          <p style="font-size:0.68rem; color:var(--text-muted); margin:6px 0 0; line-height:1.5" id="ocr-mode-desc">
+            🔄 ระบบจะเลือกโหมดที่เหมาะสมอัตโนมัติ
+          </p>
+        </div>
+
+        <!-- OCR Button -->
+        <div class="tool-row">
+          <button id="ocr-btn" class="btn btn-primary" disabled style="flex:2">
+            🤖 เริ่ม OCR อ่านข้อความ
+          </button>
+        </div>
+
+        <!-- Progress -->
+        <div id="progress-wrap" class="progress-wrap">
+          <div class="progress-label">
+            <span id="progress-label-text">กำลังประมวลผล...</span>
+            <span id="progress-pct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div id="progress-bar" class="progress-bar"></div>
+          </div>
+        </div>
+
+        <!-- Info chips -->
+        <div class="info-chips" style="margin-top:14px">
+          <div class="chip">
+            <span class="dot" style="background:var(--accent-primary)"></span>
+            คำ: <strong id="word-count">—</strong>
+          </div>
+          <div class="chip">
+            <span class="dot" style="background:var(--accent-secondary)"></span>
+            บรรทัด: <strong id="line-count">—</strong>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══ STEP 4: OCR Result ══════════════════════════════════ -->
+    <div class="card result-panel" id="result-card">
+      <div class="card-header">
+        <div class="card-title">
+          <div class="step-badge">4</div>
+          <span class="icon">📋</span>
+          <span>ผลลัพธ์ OCR — แบ่งหัวข้อ</span>
+        </div>
+        <div class="result-toolbar">
+          <button id="copy-btn" class="btn btn-secondary" disabled style="font-size:0.78rem;padding:7px 14px">
+            📋 คัดลอก
+          </button>
+          <button id="download-btn" class="btn btn-secondary" disabled style="font-size:0.78rem;padding:7px 14px">
+            ⬇️ ดาวน์โหลด
+          </button>
+          <button id="clear-result-btn" class="btn btn-danger" style="font-size:0.78rem;padding:7px 14px">
+            🗑️ ล้าง
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+
+        <!-- Legend -->
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+          <span class="section-label label-heading" style="margin:0">📋 หัวข้อหลัก</span>
+          <span class="section-label label-subheading" style="margin:0">📌 หัวข้อรอง</span>
+          <span class="section-label label-body" style="margin:0">📝 เนื้อหา</span>
+        </div>
+
+        <hr class="divider" style="margin-top:0" />
+
+        <!-- Result Content -->
+        <div id="result-body" class="result-body">
+          <div class="result-empty">
+            <span class="em-icon">📄</span>
+            <p>ผลลัพธ์ OCR จะแสดงที่นี่<br>หลังจากกด "เริ่ม OCR"</p>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div><!-- /main-grid -->
+</div><!-- /app-wrapper -->
+
+<script src="scanner.js"></script>
+<script src="ocr.js"></script>
+<script src="document-loader.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
