@@ -550,23 +550,71 @@ const DocumentLoader = (() => {
   // ── Build structured sections from PDF text lines ────────────
   function structurePDFLines(lines) {
     if (!lines?.length) return [];
-    const sizes = lines.map(l => l.fontSize).filter(s => s > 0);
+
+    // Delegate when OCREngine classification rules exist? Keep self-contained + compatible:
+    const sizes = lines.map(l => l.fontSize).filter(s => s > 0 && s < 500);
     const med  = percentile(sizes, 50);
     const p75  = percentile(sizes, 75);
     const p90  = percentile(sizes, 90);
+
+    const coverAnchorRe = /^(โดย|ผู้จัดทำ|จัดทำโดย|เสนอ|อาจารย์ที่ปรึกษา)\s*[:\-]?\s*$/;
+    const coverDetailRe = /^(นาย|นางสาว|น\.ส\.|นาง|รหัส\s*(?:นักศึกษา|ประจำตัว|นิสิต)|Student\s*ID|รายงาน.{0,8}เป็นส่วนหนึ่งของ)/i;
+    let metaStartIdx = -1;
+    for (let i = 0; i < Math.min(lines.length, 14); i++) {
+      const txt = (lines[i].text || '').trim();
+      if (coverAnchorRe.test(txt) || coverDetailRe.test(txt)) {
+        metaStartIdx = i;
+        break;
+      }
+    }
+
+    const rawItems = [];
+    lines.forEach(({ text, fontSize }, idx) => {
+      const t = (text || '').trim();
+      if (!t) return;
+      const rel = med > 0 ? fontSize / med : 1;
+      const isProse =
+        t.length > 85 ||
+        /^(โดย|ผู้จัดทำ|จัดทำโดย|เสนอ|นาย|นางสาว|น\.ส\.|นาง|รหัส\s*(?:นักศึกษา|ประจำตัว)|Student\s*ID)\b/i.test(t) ||
+        /^(รายงาน|ระบบ|เอกสาร|โครงการ|โครงงาน)\s*(?:นี้|นั้น|ดังกล่าว)/.test(t) ||
+        /(เป็นส่วนหนึ่งของ|ซึ่งเป็น|โดยจะต้อง|จะต้องมี|สามารถ.{1,35}ได้|ในรัศมีไม่เกิน)/.test(t) ||
+        (/^\d+[.)]\s+\S/.test(t) && (t.length > 40 || /(จะต้อง|สามารถ|เพื่อ|โดย|and|or|create|develop)/i.test(t)));
+
+      let type = 'body';
+      if (!isProse && t.length <= 75 && /[A-Za-z\u0E01-\u0E2E]/.test(t) && !/^[\u0E30-\u0E3A\u0E45-\u0E4E]/.test(t)) {
+        if (rel >= 1.28 && (p90 <= med * 1.05 || fontSize >= p90 * 0.90)) type = 'h1';
+        else if (rel >= 1.14 && fontSize >= p75 * 0.92 && !/^\d+[.)]\s/.test(t)) type = 'h2';
+        else if (/^(บทที่\s*\d+|ภาคผนวก|สารบัญ|บทคัดย่อ|รายงานการ|ประกาศเรื่อง|CHAPTER\s+\d+|ABSTRACT)/i.test(t)) type = 'h1';
+        else if (/^(หัวข้อ|ตอนที่|ส่วนที่|บทนำ|สรุป|โครงการ|โครงงาน|SECTION|Chapter|Options?)\b/i.test(t) || /^\([A-Z][A-Za-z0-9\s\-&,\/\.]{4,}\)$/.test(t)) type = 'h2';
+        else if (/^(ระบบ|แอปพลิเคชัน|โปรแกรม|การพัฒนา)/.test(t) && t.length <= 58 && !/[.,;!]$/.test(t)) type = 'h2';
+        else if (/^\d+(\.\d+)+\s+\S/.test(t) && t.length <= 55) type = 'h3';
+      }
+
+      if (metaStartIdx > 0 && idx < metaStartIdx && type === 'body' && !isProse && t.length >= 4 && t.length <= 75 && !/[.,;!]$/.test(t)) {
+        const hasH1 = rawItems.some(r => r.type === 'h1');
+        type = hasH1 ? 'h2' : 'h1';
+      }
+      rawItems.push({ type, text: t });
+    });
+
     const sections = [];
     let cur = null;
-    lines.forEach(({ text, fontSize }) => {
-      if (!text) return;
-      const rel = med > 0 ? fontSize / med : 1;
-      let type = 'body';
-      if (fontSize >= p90 * 0.9 || rel >= 1.5)                              type = 'h1';
-      else if (fontSize >= p75 * 0.9 || rel >= 1.2)                          type = 'h2';
-      else if (/^\d+[\.\)]\s/.test(text) && text.length <= 80)               type = 'h3';
-      else if (/^(หัวข้อ|บทที่|ตอนที่|ส่วนที่|SECTION|Chapter)/i.test(text)) type = 'h2';
-      if (type !== 'body') { cur = { type, text, children: [] }; sections.push(cur); }
-      else if (cur) { const last = cur.children[cur.children.length-1]; if (last?.type==='body') last.text += '\n'+text; else cur.children.push({type:'body',text}); }
-      else sections.push({ type:'body', text, children:[] });
+    rawItems.forEach(({ type, text }) => {
+      if (type !== 'body') {
+        cur = { type, text, children: [] };
+        sections.push(cur);
+      } else if (cur && (cur.type === 'h1' || cur.type === 'h2' || cur.type === 'h3')) {
+        const last = cur.children[cur.children.length - 1];
+        if (last?.type === 'body') last.text += '\n' + text;
+        else cur.children.push({ type: 'body', text });
+      } else {
+        const prev = sections[sections.length - 1];
+        if (prev && prev.type === 'body' && (!prev.children || prev.children.length === 0)) {
+          prev.text += '\n' + text;
+        } else {
+          sections.push({ type: 'body', text, children: [] });
+        }
+      }
     });
     return sections;
   }

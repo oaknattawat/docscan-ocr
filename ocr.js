@@ -226,15 +226,95 @@ const OCREngine = (() => {
   }
 
   /**
-   * Light preprocessing: deskew + upscale + white padding + gentle shadow balance & crisp sharpening.
+   * Trim uniform dark margins/letterboxing (e.g. black pillarboxes around a photographed/cropped page)
+   * when the interior actually contains a bright document sheet. Avoids wasting upscale resolution
+   * on black borders and prevents dark borders from skewing paper brightness estimation.
+   */
+  function trimDarkMargins(canvas) {
+    const w = canvas.width;
+    const h = canvas.height;
+    if (w < 80 || h < 80) return canvas;
+
+    const ctx = canvas.getContext('2d');
+    const data = ctx.getImageData(0, 0, w, h).data;
+
+    // Sample interior luminance (center 60% box) to confirm bright paper exists
+    let brightCount = 0;
+    let totalSample = 0;
+    const ix0 = Math.floor(w * 0.15), ix1 = Math.ceil(w * 0.85);
+    const iy0 = Math.floor(h * 0.15), iy1 = Math.ceil(h * 0.85);
+    const stepX = Math.max(2, Math.floor((ix1 - ix0) / 40));
+    const stepY = Math.max(2, Math.floor((iy1 - iy0) / 40));
+    for (let y = iy0; y < iy1; y += stepY) {
+      for (let x = ix0; x < ix1; x += stepX) {
+        const i = (y * w + x) * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (lum >= 165) brightCount++;
+        totalSample++;
+      }
+    }
+    if (!totalSample || brightCount / totalSample < 0.18) return canvas;
+
+    const isDarkRow = (y) => {
+      let dark = 0, cnt = 0;
+      const s = Math.max(2, Math.floor(w / 60));
+      for (let x = 0; x < w; x += s) {
+        const i = (y * w + x) * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (lum < 55) dark++;
+        cnt++;
+      }
+      return cnt > 0 && dark / cnt >= 0.96;
+    };
+
+    const isDarkCol = (x) => {
+      let dark = 0, cnt = 0;
+      const s = Math.max(2, Math.floor(h / 60));
+      for (let y = 0; y < h; y += s) {
+        const i = (y * w + x) * 4;
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (lum < 55) dark++;
+        cnt++;
+      }
+      return cnt > 0 && dark / cnt >= 0.96;
+    };
+
+    let top = 0, bottom = h - 1, left = 0, right = w - 1;
+    while (top < h * 0.4 && isDarkRow(top)) top++;
+    while (bottom > h * 0.6 && isDarkRow(bottom)) bottom--;
+    while (left < w * 0.4 && isDarkCol(left)) left++;
+    while (right > w * 0.6 && isDarkCol(right)) right--;
+
+    // Keep small clean padding if we trimmed meaningfully
+    const pad = 8;
+    const tx0 = Math.max(0, left - pad);
+    const ty0 = Math.max(0, top - pad);
+    const tx1 = Math.min(w, right + 1 + pad);
+    const ty1 = Math.min(h, bottom + 1 + pad);
+    const nw = tx1 - tx0;
+    const nh = ty1 - ty0;
+
+    if (nw >= 80 && nh >= 80 && (w - nw >= 24 || h - nh >= 24)) {
+      const cropped = document.createElement('canvas');
+      cropped.width = nw;
+      cropped.height = nh;
+      cropped.getContext('2d').drawImage(canvas, tx0, ty0, nw, nh, 0, 0, nw, nh);
+      return cropped;
+    }
+    return canvas;
+  }
+
+  /**
+   * Light preprocessing: trim black margins + deskew + upscale + white padding + shadow balance & sharpening.
    * Preserves colored banners, highlighters, and fine Thai diacritics.
    */
   function preprocessLight(source) {
     const rawCanvas = getSourceCanvas(source);
     if (!rawCanvas) return source;
-    const srcCanvas = autoDeskewCanvas(rawCanvas);
+    const trimmed = trimDarkMargins(rawCanvas);
+    const srcCanvas = autoDeskewCanvas(trimmed);
 
-    const outCanvas = scaleAndPadCanvas(srcCanvas, 2200, 3000, 24);
+    const outCanvas = scaleAndPadCanvas(srcCanvas, 2200, 3200, 24);
     const outCtx = outCanvas.getContext('2d');
     const w = outCanvas.width;
     const h = outCanvas.height;
@@ -306,15 +386,16 @@ const OCREngine = (() => {
   }
 
   /**
-   * Document preprocessing: deskew + grayscale + contrast normalize + soft background whitening
-   * Keeps anti-aliased grayscale strokes intact for Tesseract LSTM (avoids harsh 0/255 damage).
+   * Document preprocessing: trim dark margins + deskew + grayscale + paper-white division + contrast curve.
+   * Uses local bright-paper estimation (NOT local mean!) so thin Thai tone marks (่ ้ ๊ ๋ ิ ี) are never erased.
    */
   function preprocessDocument(source) {
     const rawCanvas = getSourceCanvas(source);
     if (!rawCanvas) return source;
-    const srcCanvas = autoDeskewCanvas(rawCanvas);
+    const trimmed = trimDarkMargins(rawCanvas);
+    const srcCanvas = autoDeskewCanvas(trimmed);
 
-    const procCanvas = scaleAndPadCanvas(srcCanvas, 2000, 3000, 24);
+    const procCanvas = scaleAndPadCanvas(srcCanvas, 2200, 3200, 24);
     const procCtx = procCanvas.getContext('2d');
     const w = procCanvas.width;
     const h = procCanvas.height;
@@ -332,7 +413,8 @@ const OCREngine = (() => {
       histogram[g]++;
     }
 
-    // Auto-invert dark-mode screenshots/photos (dark background + light text) for Tesseract
+    // Auto-invert genuine dark-mode UI screenshots (majority dark background + sparse light text),
+    // while NOT inverting bright paper sitting on dark borders.
     const totalPixels = w * h;
     let darkCheckSum = 0;
     let medianGray = 255;
@@ -343,7 +425,11 @@ const OCREngine = (() => {
         break;
       }
     }
-    if (medianGray < 105) {
+    let brightPixels = 0;
+    for (let i = 175; i < 256; i++) brightPixels += histogram[i];
+    const brightRatio = brightPixels / totalPixels;
+
+    if (medianGray < 105 && brightRatio < 0.28) {
       histogram.fill(0);
       for (let i = 0; i < gray.length; i++) {
         const inv = 255 - gray[i];
@@ -352,57 +438,91 @@ const OCREngine = (() => {
       }
     }
 
-    // Contrast stretch (0.5% - 99.5%)
+    // Gentle highlight-preserving contrast stretch (0.2% - 99.5%)
     let minVal = -1;
     let maxVal = 255;
     let cumSum = 0;
     for (let i = 0; i < 256; i++) {
       cumSum += histogram[i];
-      if (minVal === -1 && cumSum >= totalPixels * 0.005) minVal = i;
+      if (minVal === -1 && cumSum >= totalPixels * 0.002) minVal = i;
       if (cumSum >= totalPixels * 0.995) { maxVal = i; break; }
     }
     if (minVal === -1) minVal = 0;
-    const range = maxVal - minVal || 1;
+    // Cap minVal so sparse cover pages (<0.2% ink) never stretch paper grain into dark ink
+    minVal = Math.min(minVal, Math.min(75, Math.round(maxVal * 0.35)));
+    const range = Math.max(40, maxVal - minVal);
     for (let i = 0; i < gray.length; i++) {
       gray[i] = Math.max(0, Math.min(255, Math.round(((gray[i] - minVal) * 255) / range)));
     }
 
-    // Integral image for local mean background estimation
-    const blockSize = Math.min(91, Math.max(41, (Math.round(w / 35) | 1)));
-    const halfBlock = Math.floor(blockSize / 2);
-    const integral = new Float64Array((w + 1) * (h + 1));
-    for (let y = 0; y < h; y++) {
-      let rowSum = 0;
-      for (let x = 0; x < w; x++) {
-        rowSum += gray[y * w + x];
-        integral[(y + 1) * (w + 1) + (x + 1)] = integral[y * (w + 1) + (x + 1)] + rowSum;
+    // Coarse 28x28 grid of local PAPER WHITE (90th percentile in each cell) so dark ink never pulls down threshold
+    const gridN = 28;
+    const cellW = Math.max(1, Math.ceil(w / gridN));
+    const cellH = Math.max(1, Math.ceil(h / gridN));
+    const paperGrid = new Float64Array(gridN * gridN);
+    const brightSamples = [];
+
+    for (let gy = 0; gy < gridN; gy++) {
+      for (let gx = 0; gx < gridN; gx++) {
+        const xStart = gx * cellW;
+        const yStart = gy * cellH;
+        const xEnd = Math.min(w, xStart + cellW);
+        const yEnd = Math.min(h, yStart + cellH);
+        const vals = [];
+        const stepX = Math.max(2, Math.floor((xEnd - xStart) / 8));
+        const stepY = Math.max(2, Math.floor((yEnd - yStart) / 8));
+        for (let y = yStart; y < yEnd; y += stepY) {
+          for (let x = xStart; x < xEnd; x += stepX) {
+            vals.push(gray[y * w + x]);
+          }
+        }
+        vals.sort((a, b) => a - b);
+        const p90 = vals.length ? vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.90))] : 255;
+        paperGrid[gy * gridN + gx] = p90;
+        if (p90 >= 150) brightSamples.push(p90);
       }
     }
 
-    // Soft background whitening: preserve thin Thai tone marks (่ ้ ๊ ๋) while whitening paper
+    // Fallback paper white if any cell fell completely on a dark desk corner
+    brightSamples.sort((a, b) => a - b);
+    const globalPaperBg = brightSamples.length
+      ? brightSamples[Math.floor(brightSamples.length * 0.5)]
+      : 245;
+
+    for (let i = 0; i < paperGrid.length; i++) {
+      if (paperGrid[i] < 110) paperGrid[i] = globalPaperBg;
+    }
+
+    // Divide by local paper white -> normalize shadows, keep ALL thin Thai strokes & tone marks intact
     for (let y = 0; y < h; y++) {
-      const y1 = Math.max(0, y - halfBlock);
-      const y2 = Math.min(h - 1, y + halfBlock);
+      const gyF = Math.min(gridN - 1.001, (y / h) * gridN);
+      const gy0 = Math.floor(gyF);
+      const gy1 = Math.min(gridN - 1, gy0 + 1);
+      const fy = gyF - gy0;
+
       for (let x = 0; x < w; x++) {
-        const x1 = Math.max(0, x - halfBlock);
-        const x2 = Math.min(w - 1, x + halfBlock);
-        const count = (x2 - x1 + 1) * (y2 - y1 + 1);
-        const sum = integral[(y2 + 1) * (w + 1) + (x2 + 1)]
-                  - integral[y1 * (w + 1) + (x2 + 1)]
-                  - integral[(y2 + 1) * (w + 1) + x1]
-                  + integral[y1 * (w + 1) + x1];
-        const localMean = sum / count;
+        const gxF = Math.min(gridN - 1.001, (x / w) * gridN);
+        const gx0 = Math.floor(gxF);
+        const gx1 = Math.min(gridN - 1, gx0 + 1);
+        const fx = gxF - gx0;
+
+        const b00 = paperGrid[gy0 * gridN + gx0];
+        const b10 = paperGrid[gy0 * gridN + gx1];
+        const b01 = paperGrid[gy1 * gridN + gx0];
+        const b11 = paperGrid[gy1 * gridN + gx1];
+        const localBg = Math.max(110, (b00 * (1 - fx) + b10 * fx) * (1 - fy) + (b01 * (1 - fx) + b11 * fx) * fy);
 
         const g = gray[y * w + x];
+        const rel = Math.min(255, (g / localBg) * 255);
+
         let val;
-        if (g < 70) {
-          val = g;
-        } else if (g >= localMean - 3 && g > 155) {
+        if (rel >= 232) {
           val = 255;
+        } else if (rel <= 35) {
+          val = 0;
         } else {
-          // Darken thin anti-aliased ink/tone-marks relative to local background
-          const thresh = Math.max(localMean, 90);
-          val = Math.max(0, Math.min(240, Math.round((g / thresh) * 185)));
+          // Gentle ink-darkening curve preserving anti-aliased thin marks (rel 35..231 -> 0..235)
+          val = Math.max(0, Math.min(240, Math.round(Math.pow((rel - 35) / 197, 1.3) * 238)));
         }
 
         const pi = (y * w + x) * 4;
@@ -411,7 +531,7 @@ const OCREngine = (() => {
       }
     }
 
-    sharpenImageData(imageData, 0.35, 10);
+    sharpenImageData(imageData, 0.3, 10);
     procCtx.putImageData(imageData, 0, 0);
     return procCanvas;
   }
@@ -607,26 +727,39 @@ const OCREngine = (() => {
     if (t.length < 2) return true;
 
     const conf = seg.confidence ?? 100;
-    if (conf < 22) return true;
+    if (conf > 0 && conf < 22) return true;
 
     const alnumMatches = t.match(/[\u0E00-\u0E7FA-Za-z0-9]/g) || [];
     if (alnumMatches.length === 0) return true;
 
     // Filter short lines with low confidence or mostly garbage symbols
     const symbolRatio = 1 - (alnumMatches.length / t.length);
-    if (t.length <= 6 && conf < 40 && symbolRatio > 0.35) return true;
-    if (symbolRatio > 0.65 && conf < 55) return true;
+    if (t.length <= 6 && conf > 0 && conf < 45 && symbolRatio > 0.3) return true;
+    if (symbolRatio > 0.65 && conf > 0 && conf < 60) return true;
 
-    // Filter fragmented screen/texture hallucinations (e.g. "v - a »v", "๑ | จ v ๑", "ซ ๕")
-    if (conf < 48 && t.length <= 18) {
-      const tokens = t.split(/\s+/).filter(Boolean);
+    // Thai syllables can never start with trailing/combining marks (ะ ั า ำ ิ ี ึ ื ุ ู ฺ ๆ ็ ่ ้ ๊ ๋ ์)
+    const startsWithThaiNonStarter = /^[\u0E30-\u0E3A\u0E45-\u0E4E]/.test(t);
+    const tokens = t.split(/\s+/).filter(Boolean);
+    const avgTokLen = tokens.length ? tokens.reduce((s, tok) => s + tok.length, 0) / tokens.length : t.length;
+
+    if (startsWithThaiNonStarter && t.length <= 28 && (conf < 72 || avgTokLen <= 3.5)) {
+      return true;
+    }
+
+    // Filter fragmented screen/texture hallucinations (e.g. "v - a »v", "๑ | จ v ๑", "ซ ๕", "ชู ๕")
+    if (conf > 0 && conf < 55 && t.length <= 18) {
       const singleTokens = tokens.filter(tok => tok.length === 1).length;
-      if (tokens.length >= 2 && singleTokens / tokens.length >= 0.65 && !/^\d+$/.test(tokens[0])) {
+      if (tokens.length >= 2 && singleTokens / tokens.length >= 0.6 && !/^\d+$/.test(tokens[0])) {
         return true;
       }
       if (/[\u0E50-\u0E59]/.test(t) && tokens.length >= 2) {
         return true;
       }
+    }
+
+    // Filter tiny isolated non-word margin specks (e.g. "4%", "otal" at low confidence)
+    if (conf > 0 && conf < 55 && t.length <= 5 && tokens.length === 1 && !/^(โดย|บทนำ|สรุป|หน้า|\d+\.?)$/.test(t)) {
+      return true;
     }
 
     return false;
@@ -691,11 +824,18 @@ const OCREngine = (() => {
           const y1 = Math.max(...words.map(w => w.bbox?.y1 ?? bbox.y1));
           const avgConf = words.reduce((s, w) => s + (w.confidence ?? line.confidence ?? 0), 0) / words.length;
 
+          // Use percentile of word heights so one tall stray glyph/dot doesn't inflate fontSize into a fake H1
+          const wordHeights = words
+            .map(w => (w.bbox ? Math.max(8, w.bbox.y1 - w.bbox.y0) : lineH))
+            .filter(h => h > 0);
+          const coreH = wordHeights.length ? percentile(wordHeights, 65) : lineH;
+          const estSize = Math.min(Math.max(y1 - y0, lineH), coreH * 1.25);
+
           const seg = {
             text,
             bbox: { x0, y0, x1, y1 },
             confidence: avgConf,
-            fontSize: Math.max(y1 - y0, lineH),
+            fontSize: estSize || lineH,
           };
           if (!isNoiseSegment(seg)) segments.push(seg);
         });
@@ -902,6 +1042,203 @@ const OCREngine = (() => {
   // TEXT STRUCTURE ANALYSIS
   // ══════════════════════════════════════════════════════════════
 
+  function computeFontStats(lines) {
+    const reliable = lines
+      .filter(l => (l.text || '').trim().length >= 2 && ((l.confidence ?? 0) === 0 || l.confidence >= 45))
+      .map(l => estimateFontSize(l))
+      .filter(s => s > 0);
+    const fontSizes = reliable.length >= 2
+      ? reliable
+      : lines.map(l => estimateFontSize(l)).filter(s => s > 0);
+    return {
+      medianSize: percentile(fontSizes, 50),
+      p75: percentile(fontSizes, 75),
+      p90: percentile(fontSizes, 90),
+    };
+  }
+
+  function isValidHeadingCandidate(text, confidence = 0) {
+    const t = (text || '').trim();
+    if (!t || t.length < 2 || t.length > 90) return false;
+    if (confidence > 0 && confidence < 45) return false;
+    // Thai combining/trailing marks can never begin a real heading
+    if (/^[\u0E30-\u0E3A\u0E45-\u0E4E]/.test(t)) return false;
+    // Bullets or decorative symbols
+    if (/^[•▪▸►\*\-—–]/.test(t)) return false;
+    // Must contain real Thai consonants or Latin letters (not just numbers/percent/symbols)
+    if (!/[A-Za-z\u0E01-\u0E2E]/.test(t)) return false;
+    return true;
+  }
+
+  function isProseOrMetadata(text) {
+    const t = (text || '').trim();
+    if (!t) return true;
+    // Cover-page author / student / academic metadata
+    if (/^(โดย|ผู้จัดทำ|จัดทำโดย|เสนอ|เสนอต่อ|อาจารย์ที่ปรึกษา|ที่ปรึกษา)\s*[:\-]?\s*$/.test(t)) return true;
+    if (/^(นาย|นางสาว|น\.ส\.|นาง|ดร\.|ผศ\.|รศ\.|ศ\.|Mr\.|Mrs\.|Ms\.|Dr\.)\s*\S/.test(t)) return true;
+    if (/^(รหัส\s*(?:นักศึกษา|ประจำตัว|นิสิต)?|เลขประจำตัว|Student\s*ID)\s*[:\-]?\s*[A-Za-z0-9]/i.test(t)) return true;
+    if (/^(ภาคเรียนที่|ปีการศึกษา|ประจำปี|พ\.ศ\.|ค\.ศ\.)\s/.test(t)) return true;
+    if (/^(รายงาน|ระบบ|เอกสาร|โครงการ|โครงงาน|แบบฟอร์ม|ประกาศ|หัวข้อ|แอป(?:พลิเคชัน)?|โปรแกรม)\s*(?:นี้|นั้น|ดังกล่าว)/.test(t)) return true;
+    if (/(เป็นส่วนหนึ่งของ|เสนอต่อ.{1,20}รายวิชา|ซึ่งเป็น|โดยจะต้อง|จะต้องมี|จะต้องสามารถ|สามารถ.{1,35}ได้|เพื่อตรวจสอบ|ในรัศมีไม่เกิน|ตัวเลือกให้เลือก|ตัวเลือกคือให้|ออกมาให้ทดลองใช้|ส่งมาพร้อม)/.test(t)) return true;
+    // Numbered prose items (e.g. "1) ทำแอปลงเวลา...", "1) Attendance Tracker: Create an application...")
+    if (/^\d+[.)]\s+\S/.test(t)) {
+      const rest = t.replace(/^\d+[.)]\s+/, '');
+      if (
+        rest.length > 36 ||
+        /(จะต้อง|สามารถ|เพื่อ|โดยมี|โดยจะ|คือให้|สำหรับ|ทำการ|ก็ได้|นักศึกษา|อาจารย์)/.test(rest) ||
+        /:\s+\S+\s+\S+\s+\S+/.test(rest) ||
+        /\b(and|or|that|which|where|with|for|create|develop|make|allow|must|will|shall|can|should|is|are|using|whereby)\b/i.test(rest)
+      ) {
+        return true;
+      }
+    }
+    // Incomplete Thai clause endings typical of wrapped paragraph lines
+    if (t.length > 26 && /(และ|หรือ|ที่|ซึ่ง|เพื่อ|โดย|กับ|จาก|ใน|ของ|ให้|จะ|ต้อง|ได้|เป็น|ว่า|มา|ไป|อยู่|ทั้งนี้|สำหรับ|แต่|ถ้า|หาก|เมื่อ)$/.test(t)) {
+      return true;
+    }
+    if (/\.$/.test(t) && t.length > 38 && /\b(is|are|was|were|must|will|shall|can|should|that|which|where|with|and|or)\b/i.test(t)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Detect index where cover-page metadata starts (e.g. "โดย", author name, student ID, "รายงานนี้เป็นส่วนหนึ่งของ").
+   * Returns { hasCoverMeta, metaStartIdx } using lines or flattened blocks.
+   */
+  function findCoverMetaBoundary(items) {
+    const coverAnchorRe = /^(โดย|ผู้จัดทำ|จัดทำโดย|เสนอ|เสนอต่อ|อาจารย์ที่ปรึกษา|ที่ปรึกษา)\s*[:\-]?\s*$/;
+    const coverDetailRe = /^(นาย|นางสาว|น\.ส\.|นาง|รหัส\s*(?:นักศึกษา|ประจำตัว|นิสิต)|Student\s*ID|รายงาน.{0,8}เป็นส่วนหนึ่งของ)/i;
+    for (let i = 0; i < Math.min(items.length, 14); i++) {
+      const txt = (items[i]?.text || '').trim();
+      if (coverAnchorRe.test(txt) || coverDetailRe.test(txt)) {
+        return { hasCoverMeta: i >= 1, metaStartIdx: i };
+      }
+    }
+    return { hasCoverMeta: false, metaStartIdx: -1 };
+  }
+
+  function classifyLine(text, fontSize, medianSize, p75, p90, confidence) {
+    const t = (text || '').trim();
+    if (!t || t.length < 2) return 'body';
+
+    if (confidence > 0 && confidence < 45) return 'body';
+    if (/^[•▪▸►\*]\s/.test(t) || /^-\s+\S/.test(t)) return 'bullet';
+    if (!isValidHeadingCandidate(t, confidence)) return 'body';
+
+    const relSize = medianSize > 0 ? fontSize / medianSize : 1;
+    const proseOrMeta = isProseOrMetadata(t);
+
+    // 1. Explicit document / chapter / report main titles (h1) — check before generic sentence heuristics
+    const h1Patterns = [
+      /^(บทที่\s*\d+|ภาคผนวก|สารบัญ|บทคัดย่อ|กิตติกรรมประกาศ|บรรณานุกรม)/,
+      /^(รายงานการ|รายงานผล|รายงานประจำ|แบบเสนอโครงการ|แบบเสนอโครงงาน|ประกาศเรื่อง|คำสั่งที่|ระเบียบว่าด้วย)/,
+      /^(CHAPTER\s+\d+|PART\s+\d+|ABSTRACT|TABLE OF CONTENTS|APPENDIX)\b/i,
+    ];
+    if (!proseOrMeta && t.length <= 75 && h1Patterns.some(r => r.test(t))) return 'h1';
+
+    // 2. Explicit labeled topic headers like "Options: Choose only 1 application..." or "หมายเหตุ: ..."
+    if (/^(Options?|Instructions?|Directions?|หมายเหตุ|คำชี้แจง|หัวข้อ)\s*:/i.test(t) && t.length <= 95 && !/^\d+[.)]/.test(t)) {
+      return 'h2';
+    }
+
+    // 3. Font-size based classification
+    const isNumbered = /^\d+[.)]\s/.test(t);
+    if (!proseOrMeta && !isNumbered && t.length <= 75) {
+      if (relSize >= 1.28 && (p90 <= medianSize * 1.05 || fontSize >= p90 * 0.90)) return 'h1';
+      if (relSize >= 1.14 && fontSize >= p75 * 0.92) return 'h2';
+    }
+
+    // 4. Explicit subheading patterns (h2)
+    const thaiSubPatterns = [
+      /^(หัวข้อ|ตอนที่|ส่วนที่|บทนำ|บทสรุป|สรุป|ข้อที่|ข้อ\s*\d+\b)/,
+      /^(โครงการ|โครงงาน|ชื่อเรื่อง|ชื่องาน|ชื่อระบบ|ชื่อโครงการ|วัตถุประสงค์|ขอบเขต|ประโยชน์|หลักการ|ลักษณะ|ประเภท|องค์ประกอบ|วิธีการ|วิธีดำเนินงาน|ผลที่คาดว่าจะได้รับ|รายละเอียด|หมายเหตุ|ขั้นตอนการ)(?:\s*:|\s|$)/,
+    ];
+    const engSubPatterns = [
+      /^(SECTION|CHAPTER|PART|ARTICLE|CLAUSE|SCHEDULE|ANNEX)\b/i,
+      /^(Summary|Introduction|Conclusion|Overview|Objective|Objectives|Background|Methodology|Results|Discussion|Options?|Requirements?|Features?)(?:\s*:|\s|$)/i,
+    ];
+    if (!proseOrMeta && t.length <= 65 && (thaiSubPatterns.some(r => r.test(t)) || engSubPatterns.some(r => r.test(t)))) {
+      return 'h2';
+    }
+
+    // Cover-page / section short noun-phrase project title (e.g. "ระบบสำรองค่าคอนฟิกอุปกรณ์เครือข่ายอัตโนมัติ")
+    const thaiProjectTitleRe = /^(ระบบ|แอปพลิเคชัน|โปรแกรม|การพัฒนา|การออกแบบ|การศึกษา|คู่มือ|แผนงาน)/;
+    if (
+      !proseOrMeta &&
+      t.length >= 4 &&
+      t.length <= 58 &&
+      !/[.,;!]$/.test(t) &&
+      thaiProjectTitleRe.test(t) &&
+      !/(จะ|ต้อง|สามารถ|หรือ|ก็ได้|ไม่เกิน|ทำงาน|ต่อไปนี้)/.test(t)
+    ) {
+      return 'h2';
+    }
+
+    const isAllCaps = t === t.toUpperCase() && /[A-Z]{3,}/.test(t) && t.length <= 55;
+    const isParenEngSubtitle = /^\([A-Z][A-Za-z0-9\s\-&,\/\.]{4,}\)$/.test(t) && t.length <= 68;
+    if (!proseOrMeta && (isAllCaps || isParenEngSubtitle)) return 'h2';
+
+    // 5. Reject prose/sentences before minor numbered check
+    const isSentenceLike = proseOrMeta || t.length > 70 || (/[.,;!]$/.test(t) && t.length > 35);
+    if (isSentenceLike) return 'body';
+
+    // 6. Minor numbered headings (h3): multi-level (1.1 Title) or strictly short label (1. บทนำ)
+    if (/^\d+(\.\d+)+\s+\S/.test(t) && t.length <= 55 && !/[.,;]$/.test(t)) return 'h3';
+    if (/^\d+[.)]\s+\S/.test(t) && t.length <= 36 && !/[.,;]$/.test(t)) return 'h3';
+
+    return 'body';
+  }
+
+  /**
+   * Apply cover-page pre-pass & pre-body merging across flat classified items { type, text, confidence }.
+   */
+  function buildSectionsFromClassified(items) {
+    // If cover metadata marker ("โดย", author name, student ID, disclaimer) is present,
+    // any valid non-prose short lines appearing BEFORE it belong to cover-page titles!
+    const { hasCoverMeta, metaStartIdx } = findCoverMetaBoundary(items);
+    if (hasCoverMeta) {
+      let hasH1BeforeMeta = items.slice(0, metaStartIdx).some(it => it.type === 'h1');
+      for (let i = 0; i < metaStartIdx; i++) {
+        const it = items[i];
+        const t = (it.text || '').trim();
+        if (
+          it.type === 'body' &&
+          isValidHeadingCandidate(t, it.confidence) &&
+          !isProseOrMetadata(t) &&
+          !/[.,;!]$/.test(t) &&
+          t.length >= 4 &&
+          t.length <= 75
+        ) {
+          it.type = hasH1BeforeMeta ? 'h2' : 'h1';
+          if (it.type === 'h1') hasH1BeforeMeta = true;
+        }
+      }
+      // Make sure items AT or AFTER metaStartIdx marked as metadata stay body
+      for (let i = metaStartIdx; i < items.length; i++) {
+        if (isProseOrMetadata(items[i].text)) {
+          items[i].type = 'body';
+        }
+      }
+    }
+
+    const sections = [];
+    let currentSection = null;
+    items.forEach((it) => {
+      if (it.type === 'h1' || it.type === 'h2' || it.type === 'h3') {
+        currentSection = { type: it.type, text: it.text, confidence: it.confidence || 0, children: [] };
+        sections.push(currentSection);
+      } else {
+        if (currentSection) {
+          currentSection.children.push({ type: 'body', text: it.text, confidence: it.confidence || 0 });
+        } else {
+          sections.push({ type: 'body', text: it.text, confidence: it.confidence || 0, children: [] });
+        }
+      }
+    });
+    return postProcessSections(mergeBodyLines(sections));
+  }
+
   function structureText(ocrData) {
     const blocks = ocrData?._blocks;
     if (blocks && blocks.length > 0) {
@@ -913,35 +1250,19 @@ const OCREngine = (() => {
     }
 
     const lines = ocrData.lines;
-    const fontSizes = lines.map(l => estimateFontSize(l)).filter(s => s > 0);
-    const medianSize = percentile(fontSizes, 50);
-    const p75 = percentile(fontSizes, 75);
-    const p90 = percentile(fontSizes, 90);
+    const { medianSize, p75, p90 } = computeFontStats(lines);
 
-    const sections = [];
-    let currentSection = null;
-
+    const items = [];
     lines.forEach((line) => {
       const text = line.text?.trim();
       if (!text || text.length < 2) return;
-
       const fontSize = estimateFontSize(line);
       const confidence = line.confidence || 0;
       const type = classifyLine(text, fontSize, medianSize, p75, p90, confidence);
-
-      if (type === 'h1' || type === 'h2' || type === 'h3') {
-        currentSection = { type, text, confidence, children: [] };
-        sections.push(currentSection);
-      } else {
-        if (currentSection) {
-          currentSection.children.push({ type: 'body', text, confidence });
-        } else {
-          sections.push({ type: 'body', text, confidence, children: [] });
-        }
-      }
+      items.push({ type, text, confidence });
     });
 
-    return mergeBodyLines(sections);
+    return buildSectionsFromClassified(items);
   }
 
   /**
@@ -949,11 +1270,14 @@ const OCREngine = (() => {
    */
   function structureFromBlocks(blocks) {
     const allLines = blocks.flatMap(b => b.lines);
-    const fontSizes = allLines.map(l => estimateFontSize(l)).filter(s => s > 0);
-    const medianSize = percentile(fontSizes, 50);
-    const p75 = percentile(fontSizes, 75);
-    const p90 = percentile(fontSizes, 90);
+    const { medianSize, p75, p90 } = computeFontStats(allLines);
 
+    // Pre-check cover page metadata across all lines in visual reading order
+    const flatTrimmed = allLines.map(l => ({ text: (l.text || '').trim(), confidence: l.confidence || 0 }));
+    const { hasCoverMeta, metaStartIdx } = findCoverMetaBoundary(flatTrimmed);
+
+    let globalLineIdx = 0;
+    let hasH1SoFar = false;
     const sections = [];
 
     blocks.forEach(block => {
@@ -961,8 +1285,10 @@ const OCREngine = (() => {
       if (!lines.length) return;
 
       let currentSection = null;
+      const blockW = Math.max(1, (block.bbox?.x1 ?? 0) - (block.bbox?.x0 ?? 0));
 
       lines.forEach((line, idx) => {
+        const myGlobalIdx = globalLineIdx++;
         const text = line.text?.trim();
         if (!text || text.length < 2) return;
 
@@ -970,17 +1296,49 @@ const OCREngine = (() => {
         const confidence = line.confidence || 0;
         let type = classifyLine(text, fontSize, medianSize, p75, p90, confidence);
 
-        // Inside a multi-line card/box, promote a short non-bullet first line to heading
+        // Cover-page promotion before metadata anchor
+        if (
+          hasCoverMeta &&
+          myGlobalIdx < metaStartIdx &&
+          type === 'body' &&
+          isValidHeadingCandidate(text, confidence) &&
+          !isProseOrMetadata(text) &&
+          !/[.,;!]$/.test(text) &&
+          text.length >= 4 &&
+          text.length <= 75
+        ) {
+          type = hasH1SoFar ? 'h2' : 'h1';
+        }
+
+        // Mind-map / multi-line card: promote short, valid first line above bullets/spaced body lines
+        // (Avoid promoting wide wrapped paragraph opening lines or prose clauses)
         if (
           idx === 0 &&
           type === 'body' &&
           lines.length > 1 &&
-          text.length <= 45 &&
-          !/^[•\-▪▸►\*]/.test(text) &&
-          !/^\d+[\.)\]]\s/.test(text)
+          !hasCoverMeta &&
+          isValidHeadingCandidate(text, confidence) &&
+          !isProseOrMetadata(text) &&
+          text.length >= 4 &&
+          text.length <= 34 &&
+          !/^\d+[.)\]]\s/.test(text) &&
+          !/[.,;]$/.test(text)
         ) {
-          type = 'h2';
+          const nextLine = lines[1];
+          const nextText = (nextLine?.text || '').trim();
+          const nextStartsBullet = /^[•▪▸►\-*]/.test(nextText) || /^\d+[.)]\s/.test(nextText);
+          const vGap = (nextLine?.bbox && line.bbox) ? (nextLine.bbox.y0 - line.bbox.y1) : 0;
+          const lineH = Math.max(fontSize, 12);
+          const lineW = line.bbox ? (line.bbox.x1 - line.bbox.x0) : 0;
+          const nextSize = nextLine ? estimateFontSize(nextLine) : fontSize;
+
+          const clearVisualBreak = nextStartsBullet || vGap > lineH * 0.35 || fontSize >= nextSize * 1.1 || (text.length <= 24 && lineW < blockW * 0.85);
+          if (clearVisualBreak) {
+            type = 'h2';
+          }
         }
+
+        if (type === 'h1') hasH1SoFar = true;
 
         if (type === 'h1' || type === 'h2' || type === 'h3') {
           currentSection = { type, text, confidence, children: [] };
@@ -989,7 +1347,6 @@ const OCREngine = (() => {
           if (currentSection) {
             currentSection.children.push({ type: 'body', text, confidence });
           } else {
-            // Orphan body block
             currentSection = { type: 'body', text, confidence, children: [] };
             sections.push(currentSection);
           }
@@ -997,7 +1354,7 @@ const OCREngine = (() => {
       });
     });
 
-    return mergeBodyLines(sections);
+    return postProcessSections(mergeBodyLines(sections));
   }
 
   function estimateFontSize(line) {
@@ -1013,33 +1370,76 @@ const OCREngine = (() => {
     return sorted[Math.min(idx, sorted.length - 1)];
   }
 
-  function classifyLine(text, fontSize, medianSize, p75, p90, confidence) {
-    const thaiHeadingPatterns = [
-      /^(หัวข้อ|บทที่|ตอนที่|ส่วนที่|บทนำ|สรุป|ข้อที่|ข้อ\s*\d)/,
-      /^(ชื่อ|ที่อยู่|วันที่|เรื่อง|เรียน|ถึง|จาก|ผู้ส่ง|ลงชื่อ)/,
-      /^(ประกาศ|คำสั่ง|ระเบียบ|แบบ|รายงาน|รายละเอียด)/,
-      /^(หลักการ|ลักษณะ|ประเภท|องค์ประกอบ|วิธี|ความหมาย|เพิ่มเติม)/,
-    ];
-    const engHeadingPatterns = [
-      /^(SECTION|CHAPTER|PART|ARTICLE|CLAUSE|SCHEDULE|ANNEX)/i,
-      /^(Name|Address|Date|Subject|To|From|Re:|Dear|Signed)/i,
-      /^(Summary|Introduction|Conclusion|Overview|Objective)/i,
-      /^\d+[\.)\]]\s+[A-ZÀ-Ö\u0E00-\u0E7F]/,
-    ];
+  // Upgrade lone h2 -> h1 when appropriate, promote top title when no headings were detected,
+  // & merge consecutive top-level body blocks
+  function postProcessSections(sections) {
+    if (!sections || !sections.length) return [];
 
-    const isAllCaps = text === text.toUpperCase() && /[A-Z]/.test(text) && text.length > 3;
-    const isShort = text.length <= 60;
-    const hasThaiHeading = thaiHeadingPatterns.some(r => r.test(text));
-    const hasEngHeading = engHeadingPatterns.some(r => r.test(text));
-    const relSize = medianSize > 0 ? fontSize / medianSize : 1;
+    let working = sections.map(s => ({ ...s, children: s.children ? [...s.children] : [] }));
 
-    if ((fontSize >= p90 * 0.95 || relSize >= 1.55) && isShort) return 'h1';
-    if ((fontSize >= p75 * 0.95 || relSize >= 1.25) && isShort) return 'h2';
-    if (hasThaiHeading || hasEngHeading) return 'h2';
-    if (isAllCaps && isShort) return 'h2';
-    if (/^\d+[\.)\]]\s/.test(text) && isShort && relSize >= 1.05) return 'h3';
-    if (/^[•\-▪▸►\*]\s/.test(text)) return 'bullet';
-    return 'body';
+    // If we have h2 but no h1 (e.g. a cover page where only "ระบบ..." or title matched h2 and no main h1 existed),
+    // promote the very first standalone h2 at index 0 to h1 so the document has a clear primary heading.
+    const hasH1 = working.some(s => s.type === 'h1');
+    const hasAnyHeading = working.some(s => s.type === 'h1' || s.type === 'h2');
+
+    if (!hasH1 && hasAnyHeading && working[0]?.type === 'h2' && (!working[0].children || working[0].children.length === 0 || working.length <= 4)) {
+      // Only promote lone top h2 when it's not a mind-map of equal sibling cards (multiple h2s with children)
+      const h2WithChildren = working.filter(s => s.type === 'h2' && s.children && s.children.length > 0).length;
+      if (h2WithChildren <= 1 || /^\u0E23\u0E30\u0E1A\u0E1A|^\u0E42\u0E04\u0E23\u0E07|^\u0E23\u0E32\u0E22\u0E07\u0E32\u0E19/.test(working[0].text)) {
+        working[0].type = 'h1';
+      }
+    }
+
+    if (!hasAnyHeading) {
+      let h1Done = false;
+      let h2Count = 0;
+      working = working.map((s, idx) => {
+        if (s.type !== 'body') return s;
+        const txt = (s.text || '').trim();
+        const singleLine = !txt.includes('\n');
+        const noEndPunct = !/[.,;:!]$/.test(txt);
+        const noChildren = s.children.length === 0;
+        if (
+          idx <= 3 &&
+          singleLine &&
+          noEndPunct &&
+          noChildren &&
+          txt.length >= 4 &&
+          txt.length <= 68 &&
+          isValidHeadingCandidate(txt, s.confidence ?? 0) &&
+          !isProseOrMetadata(txt) &&
+          !/^\d+[.)]\s/.test(txt)
+        ) {
+          if (!h1Done) {
+            h1Done = true;
+            return { ...s, type: 'h1' };
+          }
+          if (h2Count < 2) {
+            h2Count++;
+            return { ...s, type: 'h2' };
+          }
+        }
+        return s;
+      });
+    }
+
+    // Merge consecutive top-level body blocks so metadata/paragraphs don't repeat "📝 เนื้อหา" badges
+    const merged = [];
+    for (const sec of working) {
+      const prev = merged[merged.length - 1];
+      if (
+        prev &&
+        prev.type === 'body' &&
+        sec.type === 'body' &&
+        (!prev.children || prev.children.length === 0) &&
+        (!sec.children || sec.children.length === 0)
+      ) {
+        prev.text = [prev.text, sec.text].filter(Boolean).join('\n');
+      } else {
+        merged.push(sec);
+      }
+    }
+    return merged;
   }
 
   function mergeBodyLines(sections) {
@@ -1067,29 +1467,12 @@ const OCREngine = (() => {
   function fallbackStructure(rawText) {
     if (!rawText) return [];
     const lines = rawText.split('\n').map(l => fixThaiSpaces(l.trim())).filter(Boolean);
-    const sections = [];
-    let currentSection = null;
-
-    lines.forEach(line => {
-      const isHeading =
-        (line.length <= 60 && /^[A-ZÀ-Ö\u0E00-\u0E7F]/.test(line) && !/[.,:;]$/.test(line)) ||
-        /^(หัวข้อ|บทที่|ตอนที่|SECTION|CHAPTER|Part)/i.test(line) ||
-        (line === line.toUpperCase() && line.length > 3 && /[A-Z]/.test(line));
-
-      if (isHeading) {
-        currentSection = { type: 'h2', text: line, confidence: 0, children: [] };
-        sections.push(currentSection);
-      } else {
-        if (currentSection) {
-          const last = currentSection.children[currentSection.children.length - 1];
-          if (last && last.type === 'body') last.text += '\n' + line;
-          else currentSection.children.push({ type: 'body', text: line });
-        } else {
-          sections.push({ type: 'body', text: line, confidence: 0, children: [] });
-        }
-      }
-    });
-    return sections;
+    const items = lines.map(text => ({
+      type: classifyLine(text, 0, 0, 0, 0, 0),
+      text,
+      confidence: 0,
+    }));
+    return buildSectionsFromClassified(items);
   }
 
   // ── Render structured output to DOM ───────────────────────────
@@ -1173,7 +1556,7 @@ const OCREngine = (() => {
   // GEMINI AI VISION OCR (HIGH-ACCURACY / HANDWRITING / MIND MAP)
   // ══════════════════════════════════════════════════════════════
 
-  const AI_MODELS = ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-1.5-flash', 'gemini-flash-latest'];
+  const AI_MODELS = ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'];
 
   async function discoverGeminiFlashModels(apiKey) {
     try {
@@ -1244,11 +1627,14 @@ const OCREngine = (() => {
       'Transcribe ALL readable text from this image faithfully and verbatim.',
       'Rules:',
       '1. Read every heading, label, bullet point, note, table cell, and handwritten annotation accurately.',
-      '2. Preserve original Thai spelling, tone marks, vowels, numbers, and English words exactly. Do NOT summarize, translate, or paraphrase.',
+      '2. Preserve original Thai spelling, tone marks (่ ้ ๊ ๋), vowels, numbers, and English words exactly. Do NOT summarize, translate, or paraphrase.',
       '3. Keep multi-column layouts, mind-map cards, or boxed sections grouped logically: each card/section heading followed by its own body lines inside children.',
-      '4. Ignore purely decorative doodles/icons without text.',
+      '4. Ignore purely decorative doodles/icons without text and background shadows.',
       '5. Return valid JSON matching the schema: {"sections":[{"type":"h1"|"h2"|"h3"|"body","text":"...","children":[{"type":"body","text":"..."}]}]}.',
-      '   - Use "h1" for main document/title headings, "h2" for card/box subheadings, "h3" for smaller subheadings, and "body" for content lines (join multiple lines in a section with \\n).',
+      '   - Use "h1" for primary document titles or main cover-page titles (e.g. "รายงานการปฏิบัติงานเตรียมสหกิจศึกษา", "ระบบสำรองค่าคอนฟิกอุปกรณ์เครือข่ายอัตโนมัติ", mind-map center titles).',
+      '   - Use "h2" for secondary subtitles (e.g. "(Automated Network Configuration Backup System)"), section/topic headings (e.g. "Options: Choose only 1 application..."), and mind-map card headings.',
+      '   - Use "h3" ONLY for short numbered subheadings (e.g. "1. บทนำ", "2.1 หลักการ").',
+      '   - Use "body" for regular sentences, paragraphs, numbered paragraph descriptions (e.g. "1) ทำแอปลงเวลา...", "1) Attendance Tracker: Create..."), and cover-page metadata ("โดย", author names, student IDs, "รายงานนี้เป็นส่วนหนึ่งของ..."). Group consecutive body lines with \\n inside children rather than splitting every wrapped line.',
     ].join('\n');
   }
 
@@ -1258,7 +1644,13 @@ const OCREngine = (() => {
     rawSections.forEach((sec) => {
       if (!sec || typeof sec !== 'object') return;
       const text = String(sec.text || '').trim();
-      const type = ['h1', 'h2', 'h3', 'body'].includes(sec.type) ? sec.type : 'body';
+      let type = ['h1', 'h2', 'h3', 'body'].includes(sec.type) ? sec.type : 'body';
+      if (
+        (type === 'h1' || type === 'h2' || type === 'h3') &&
+        (!isValidHeadingCandidate(text, 98) || text.length > 105 || isProseOrMetadata(text))
+      ) {
+        type = 'body';
+      }
       const children = Array.isArray(sec.children)
         ? sec.children
             .map((c) => ({
@@ -1283,7 +1675,7 @@ const OCREngine = (() => {
         });
       }
     });
-    return normalized;
+    return postProcessSections(normalized);
   }
 
   function parseAISectionsResponse(rawText) {
@@ -1316,7 +1708,7 @@ const OCREngine = (() => {
     onProgress?.(15, 'กำลังเตรียมภาพสำหรับ AI...');
     const base64Data = imageSourceToJpegBase64(imageSource, 2048);
 
-    const requestBody = {
+    const buildBody = (useSchema = true) => ({
       contents: [
         {
           parts: [
@@ -1325,61 +1717,81 @@ const OCREngine = (() => {
           ],
         },
       ],
-      generationConfig: {
-        temperature: 0.1,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: {
-            sections: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  type: { type: 'STRING', enum: ['h1', 'h2', 'h3', 'body'] },
-                  text: { type: 'STRING' },
-                  children: {
-                    type: 'ARRAY',
-                    items: {
-                      type: 'OBJECT',
-                      properties: {
-                        type: { type: 'STRING', enum: ['body'] },
-                        text: { type: 'STRING' },
+      generationConfig: useSchema
+        ? {
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'OBJECT',
+              properties: {
+                sections: {
+                  type: 'ARRAY',
+                  items: {
+                    type: 'OBJECT',
+                    properties: {
+                      type: { type: 'STRING', enum: ['h1', 'h2', 'h3', 'body'] },
+                      text: { type: 'STRING' },
+                      children: {
+                        type: 'ARRAY',
+                        items: {
+                          type: 'OBJECT',
+                          properties: {
+                            type: { type: 'STRING', enum: ['body'] },
+                            text: { type: 'STRING' },
+                          },
+                          required: ['type', 'text'],
+                        },
                       },
-                      required: ['type', 'text'],
                     },
+                    required: ['type', 'text'],
                   },
                 },
-                required: ['type', 'text'],
               },
+              required: ['sections'],
             },
-          },
-          required: ['sections'],
-        },
-      },
-    };
+          }
+        : { temperature: 0.1 },
+    });
 
     const tried = new Set();
     const queue = [...AI_MODELS];
     let discovered = false;
     let lastError = null;
+    let overloadRetriedOnce = false;
+    let useSchema = true;
+
+    const pushDiscoveredModels = async () => {
+      if (discovered) return false;
+      discovered = true;
+      const liveModels = await discoverGeminiFlashModels(cleanKey);
+      const fresh = liveModels.filter((m) => !tried.has(m)).slice(0, 5);
+      fresh.forEach((m) => queue.push(m));
+      return fresh.length > 0;
+    };
 
     while (queue.length > 0) {
       const model = queue.shift();
       if (!model || tried.has(model)) continue;
       tried.add(model);
 
-      onProgress?.(Math.min(75, 30 + tried.size * 12), `กำลังส่งให้ AI (${model}) อ่านข้อความ...`);
+      onProgress?.(Math.min(75, 28 + tried.size * 10), `กำลังส่งให้ AI (${model}) อ่านข้อความ...`);
 
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': cleanKey,
-        },
-        body: JSON.stringify(requestBody),
-      });
+      let res;
+      try {
+        res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': cleanKey,
+          },
+          body: JSON.stringify(buildBody(useSchema)),
+        });
+      } catch (netErr) {
+        lastError = new Error(`การเชื่อมต่อขัดข้อง (${netErr.message || 'network'})`);
+        await pushDiscoveredModels();
+        continue;
+      }
 
       if (res.ok) {
         onProgress?.(85, 'กำลังจัดโครงสร้างข้อความจาก AI...');
@@ -1414,6 +1826,26 @@ const OCREngine = (() => {
         errMsg = errJson?.error?.message || errMsg;
       } catch (_) {}
 
+      const isAuthError =
+        res.status === 401 ||
+        res.status === 403 ||
+        /API_KEY_INVALID|API key not valid|API key expired|PERMISSION_DENIED|UNAUTHENTICATED/i.test(errMsg);
+
+      if (isAuthError) {
+        throw new Error(`Gemini API Key ไม่ถูกต้องหรือไม่มีสิทธิ์ใช้งาน (${errMsg})`);
+      }
+
+      const isSchemaError =
+        res.status === 400 &&
+        /responseSchema|response_schema|JSON mode|structured output/i.test(errMsg);
+
+      if (isSchemaError && useSchema) {
+        useSchema = false;
+        tried.delete(model);
+        queue.unshift(model);
+        continue;
+      }
+
       const isModelUnavailable =
         res.status === 404 ||
         /no longer available|not found|not supported for generateContent|deprecated/i.test(errMsg);
@@ -1421,46 +1853,38 @@ const OCREngine = (() => {
       const isOverloaded =
         res.status === 429 ||
         res.status === 503 ||
-        /high demand|overloaded|try again later|resource exhausted|quota/i.test(errMsg);
+        /high demand|overloaded|try again later|resource exhausted|quota|unavailable/i.test(errMsg);
 
       if (isModelUnavailable) {
         lastError = new Error(errMsg);
-        // If API error explicitly recommends a replacement model, try it next
         const recMatch = errMsg.match(/models\/(gemini-[a-z0-9.\-]+)/i);
         if (recMatch && !tried.has(recMatch[1])) {
           queue.unshift(recMatch[1]);
         }
-        // If queue is empty and we haven't queried /v1beta/models yet, auto-discover active models
-        if (queue.length === 0 && !discovered) {
-          discovered = true;
-          const liveModels = await discoverGeminiFlashModels(cleanKey);
-          liveModels.slice(0, 3).forEach((m) => {
-            if (!tried.has(m)) queue.push(m);
-          });
-        }
+        if (queue.length === 0) await pushDiscoveredModels();
         continue;
       }
 
       if (isOverloaded) {
-        lastError = new Error(errMsg);
-        onProgress?.(40, `Model ${model} โหลดหนัก กำลังลอง model อื่น...`);
-        // Try next model in queue instead of failing immediately
-        if (queue.length === 0 && !discovered) {
-          discovered = true;
-          const liveModels = await discoverGeminiFlashModels(cleanKey);
-          liveModels.slice(0, 3).forEach((m) => {
-            if (!tried.has(m)) queue.push(m);
-          });
+        lastError = new Error('เซิร์ฟเวอร์ AI (Gemini) มีผู้ใช้งานหนาแน่นชั่วคราว กรุณารอสักครู่แล้วลองใหม่ หรือสลับใช้โหมด Tesseract ฟรีได้ทันที');
+        onProgress?.(45, `Model ${model} โหลดหนัก กำลังลอง model อื่น...`);
+        if (queue.length === 0) {
+          const added = await pushDiscoveredModels();
+          if (!added && !overloadRetriedOnce) {
+            // One final retry on primary flash model after a brief cooldown
+            overloadRetriedOnce = true;
+            tried.delete(AI_MODELS[0]);
+            queue.push(AI_MODELS[0]);
+            await new Promise(r => setTimeout(r, 3000));
+            continue;
+          }
         }
-        // Small delay before retrying
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 2000));
         continue;
       }
 
-      if (res.status === 400 || res.status === 401 || res.status === 403) {
-        throw new Error(`Gemini API Key ไม่ถูกต้องหรือไม่มีสิทธิ์ใช้งาน (${errMsg})`);
-      }
-      throw new Error(`AI OCR ล้มเหลว: ${errMsg}`);
+      lastError = new Error(`AI OCR ล้มเหลว: ${errMsg}`);
+      if (queue.length === 0) await pushDiscoveredModels();
     }
 
     throw lastError || new Error('ไม่สามารถเชื่อมต่อ Gemini API ได้');
