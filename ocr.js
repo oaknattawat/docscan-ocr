@@ -1173,7 +1173,7 @@ const OCREngine = (() => {
   // GEMINI AI VISION OCR (HIGH-ACCURACY / HANDWRITING / MIND MAP)
   // ══════════════════════════════════════════════════════════════
 
-  const AI_MODELS = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-flash-latest'];
+  const AI_MODELS = ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-1.5-flash', 'gemini-flash-latest'];
 
   async function discoverGeminiFlashModels(apiKey) {
     try {
@@ -1418,9 +1418,14 @@ const OCREngine = (() => {
         res.status === 404 ||
         /no longer available|not found|not supported for generateContent|deprecated/i.test(errMsg);
 
+      const isOverloaded =
+        res.status === 429 ||
+        res.status === 503 ||
+        /high demand|overloaded|try again later|resource exhausted|quota/i.test(errMsg);
+
       if (isModelUnavailable) {
         lastError = new Error(errMsg);
-        // If API error explicitly recommends a replacement model (e.g. models/gemini-3.8-flash), try it next
+        // If API error explicitly recommends a replacement model, try it next
         const recMatch = errMsg.match(/models\/(gemini-[a-z0-9.\-]+)/i);
         if (recMatch && !tried.has(recMatch[1])) {
           queue.unshift(recMatch[1]);
@@ -1436,11 +1441,24 @@ const OCREngine = (() => {
         continue;
       }
 
+      if (isOverloaded) {
+        lastError = new Error(errMsg);
+        onProgress?.(40, `Model ${model} โหลดหนัก กำลังลอง model อื่น...`);
+        // Try next model in queue instead of failing immediately
+        if (queue.length === 0 && !discovered) {
+          discovered = true;
+          const liveModels = await discoverGeminiFlashModels(cleanKey);
+          liveModels.slice(0, 3).forEach((m) => {
+            if (!tried.has(m)) queue.push(m);
+          });
+        }
+        // Small delay before retrying
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
+
       if (res.status === 400 || res.status === 401 || res.status === 403) {
         throw new Error(`Gemini API Key ไม่ถูกต้องหรือไม่มีสิทธิ์ใช้งาน (${errMsg})`);
-      }
-      if (res.status === 429) {
-        throw new Error('ใช้งานเกินโควต้าฟรีชั่วคราว กรุณารอสักครู่แล้วลองใหม่');
       }
       throw new Error(`AI OCR ล้มเหลว: ${errMsg}`);
     }
